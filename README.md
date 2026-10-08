@@ -10,8 +10,7 @@ nano install.sh
 
 粘贴以下内容（长按粘贴）：
 
-```bash
-#!/data/data/com.termux/files/usr/bin/bash
+```#!/data/data/com.termux/files/usr/bin/bash
 # CowAgent Termux 一键安装脚本
 # 自动处理编译类依赖，优先使用预编译包
 
@@ -162,4 +161,19 @@ fi
 
 # ============================================================
 # 完成
-# ===========================================
+# ============================================================
+echo ""
+echo -e "${GREEN}========================================${NC}"
+echo -e "${GREEN}  ✅ 安装完成${NC}"
+echo -e "${GREEN}========================================${NC}"
+echo ""
+echo "启动项目："
+echo "  cd $PROJECT_DIR"
+echo "  python app.py"
+echo ""
+echo "Web 控制台："
+echo "  http://127.0.0.1:9899"
+echo ""
+echo "备份当前环境："
+echo "  pip freeze > requirements-lock.txt"
+echo ""
