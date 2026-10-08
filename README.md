@@ -1,16 +1,39 @@
 # cowagent-termux
+
 把这次遇到的所有坑整理成一个安装脚本。脚本会自动处理 numpy、pydantic-core、cryptography、cffi 这些需要编译的包，优先用 Termux 预编译版。
 
-保存脚本
+## 📥 安装 Termux
+
+推荐从 **F-Droid** 下载：
+https://f-droid.org/en/packages/com.termux/
+
+或从 **GitHub Releases** 下载最新 APK：
+https://github.com/termux/termux-app/releases
+
+> ⚠️ 不要使用 Google Play 版本，该版本已停止更新，可能缺少关键功能。
+
+## 🚀 一键安装脚本
 
 ```bash
-cd ~/CowAgent
-nano install.sh
+curl -sL https://raw.githubusercontent.com/littlhub/cowagent-termux/main/install.sh -o install.sh
+bash install.sh
 ```
 
-粘贴以下内容（长按粘贴）：
+或将仓库克隆后直接运行：
+```bash
+git clone https://github.com/littlhub/cowagent-termux.git
+cd cowagent-termux
+bash install.sh
+```
 
-```#!/data/data/com.termux/files/usr/bin/bash
+---
+
+### 📝 脚本内容
+
+<details>
+<summary>点击查看完整 install.sh</summary>
+
+```bash
 # CowAgent Termux 一键安装脚本
 # 自动处理编译类依赖，优先使用预编译包
 
@@ -176,4 +199,37 @@ echo "  http://127.0.0.1:9899"
 echo ""
 echo "备份当前环境："
 echo "  pip freeze > requirements-lock.txt"
-echo ""
+echo ""```
+
+</details>
+
+---
+
+## ✅ 验证安装
+
+安装完成后运行：
+
+```bash
+cd ~/cowagent-termux
+python -c "import numpy, pydantic, cryptography; print('✅ 核心依赖正常')"
+python app.py
+```
+
+访问 http://127.0.0.1:9899 打开 Web 控制台。
+
+## 📦 项目结构
+
+```
+cowagent-termux/
+├── install.sh          # 一键安装脚本
+├── requirements.txt    # Python 依赖
+├── requirements-lock.txt  # 锁定版本
+├── README.md
+└── docs/
+```
+
+## ⚠️ 注意事项
+
+- 使用 **F-Droid** 版 Termux，不要用 Google Play 版
+- 如遇网络问题，可配置代理或更换镜像源
+- 首次运行需授予存储权限：`termux-setup-storage`
