@@ -65,7 +65,11 @@ class QQMessage(ChatMessage):
         super().__init__(event_data)
         self.msg_id = event_data.get("id", "")
         self.create_time = event_data.get("timestamp", "")
-        self.is_group = event_type in ("GROUP_AT_MESSAGE_CREATE",)
+        # 支持群聊和频道@消息（根据 group_openid 字段判断）
+        self.is_group = (
+            event_type in ("GROUP_AT_MESSAGE_CREATE", "AT_MESSAGE_CREATE")
+            or bool(event_data.get("group_openid"))
+        )
         self.event_type = event_type
 
         author = event_data.get("author", {})

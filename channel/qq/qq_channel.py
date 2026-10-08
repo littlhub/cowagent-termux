@@ -484,6 +484,8 @@ class QQChannel(ChatChannel):
 
     def _handle_msg_event(self, event_data: dict, event_type: str):
         msg_id = event_data.get("id", "")
+        # DEBUG: Log raw event to diagnose message structure
+        logger.info(f"[QQ] Received event: type={event_type}, msg_id={msg_id}, has_attachments={'attachments' in event_data}")
         if self.received_msgs.get(msg_id):
             logger.debug(f"[QQ] Duplicate msg filtered: {msg_id}")
             return
@@ -508,7 +510,9 @@ class QQChannel(ChatChannel):
         if qq_msg.ctype == ContextType.IMAGE:
             if hasattr(qq_msg, "image_path") and qq_msg.image_path:
                 file_cache.add(session_id, qq_msg.image_path, file_type="image")
-                logger.info(f"[QQ] Image cached for session {session_id}")
+                logger.info(f"[QQ] Image cached for session {session_id}: {qq_msg.image_path}")
+            else:
+                logger.warning(f"[QQ] Image message has no path, event_type={event_type}")
             return
 
         # A standalone file / video / voice message carries no text to answer,
@@ -624,7 +628,13 @@ class QQChannel(ChatChannel):
                                    receiver, is_group)
             return
 
-        event_type = getattr(msg, "event_type", "")
+        # Fix: Use is_group from context to determine event_type,
+        # because msg.event_type may be stale or incorrect when
+        # cached files are attached to a follow-up message.
+        if is_group:
+            event_type = "GROUP_AT_MESSAGE_CREATE"
+        else:
+            event_type = getattr(msg, "event_type", "C2C_MESSAGE_CREATE")
         msg_id = getattr(msg, "msg_id", "")
 
         if reply.type == ReplyType.TEXT:
