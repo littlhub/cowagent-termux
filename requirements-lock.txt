@@ -10,7 +10,7 @@ charset-normalizer==3.5.2
 cheroot==11.1.2
 click==8.5.0
 croniter==6.2.4
-cryptography @ file:///home/builder/.termux-build/python-cryptography/src
+cryptography
 dingtalk-stream==0.24.3
 discord.py==2.7.1
 frozenlist==1.8.0
@@ -26,13 +26,13 @@ mdurl==0.1.2
 more-itertools==11.1.0
 multidict==6.9.1
 multipart==2.0.1
-numpy @ file:///home/builder/.termux-build/python-numpy/src/dist/numpy-2.4.4-cp314-cp314-android_aarch64.whl#sha256=68ef31f0d8925d96da2b5e014c2c3d32a16dd68887329eeecb7f3a548222e24d
+numpy
 optionaldict==0.1.2
 pillow==12.3.0
 propcache==0.5.4
 pycryptodome==3.24.0
 pydantic==2.13.5
-pydantic_core @ file:///data/data/com.termux/files/home/pydantic_core-2.49.0-cp314-cp314-android_24_arm64_v8a.whl#sha256=589040efddcd1f5fc521256fbc448a4adda31000fc42942c5e3313e42b4ac2c6
+pydantic_core==2.49.0
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.4
 python-telegram-bot==22.8
