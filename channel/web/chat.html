@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="zh" class="">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CowAgent Console</title>
+    <link rel="icon" href="/assets/favicon.ico" type="image/x-icon">
+    <!-- Vendored third-party assets (no external CDN dependency).
+         See channel/web/static/vendor/README.md for sources & versions. -->
+    <link rel="stylesheet" href="/assets/vendor/fontawesome/css/all.min.css">
+    <link rel="stylesheet" href="/assets/vendor/fonts/inter/inter.css">
+    <script src="/assets/vendor/tailwind/tailwind.min.js"></script>
+    <script src="/assets/vendor/markdown-it/markdown-it.min.js"></script>
+    <link id="hljs-light" rel="stylesheet" href="/assets/vendor/highlightjs/styles/github.min.css">
+    <link id="hljs-dark" rel="stylesheet" href="/assets/vendor/highlightjs/styles/github-dark.min.css" disabled>
+    <script src="/assets/vendor/highlightjs/highlight.min.js"></script>
+    <script src="/assets/vendor/highlightjs/languages/python.min.js"></script>
+    <script src="/assets/vendor/highlightjs/languages/javascript.min.js"></script>
+    <script src="/assets/vendor/highlightjs/languages/java.min.js"></script>
+    <script src="/assets/vendor/highlightjs/languages/go.min.js"></script>
+    <script src="/assets/vendor/highlightjs/languages/bash.min.js"></script>
+    <script>
+    tailwind.config = {
+        darkMode: 'class',
+        theme: {
+            extend: {
+                fontFamily: {
+                    sans: ['Inter', 'system-ui', '-apple-system', 'sans-serif'],
+                    mono: ['"JetBrains Mono"', '"Fira Code"', 'Consolas', 'monospace'],
+                },
+                colors: {
+                    primary: {
+                        50: '#EDFDF3', 100: '#D4FAE2', 200: '#ABF4C7', 300: '#74E9A4',
+                        400: '#4ABE6E', 500: '#35A85B', 600: '#228547', 700: '#1C6B3B',
+                        800: '#1A5532', 900: '#16462A',
+                    }
+                },
+                animation: {
+                    'pulse-dot': 'pulseDot 1.4s infinite ease-in-out both',
+                }
+            }
+        }
+    }
+    </script>
+    <!-- Split out of a single console.css. The order is load-bearing: later
+         sheets override earlier ones, so keep it as-is and see
+         channel/web/README.md before inserting anything. -->
+    <link rel="stylesheet" href="/assets/css/base.css">
+    <link rel="stylesheet" href="/assets/css/sessions.css">
+    <link rel="stylesheet" href="/assets/css/components.css">
+    <link rel="stylesheet" href="/assets/css/markdown.css">
+    <link rel="stylesheet" href="/assets/css/chat.css">
+    <link rel="stylesheet" href="/assets/css/workspace.css">
+    <link rel="stylesheet" href="/assets/css/knowledge.css">
+    <link rel="stylesheet" href="/assets/css/agents.css">
+    <link rel="stylesheet" href="/assets/css/artifacts.css">
+    <link rel="stylesheet" href="/assets/css/menu.css">
+    <!-- Apply theme/lang before first paint to avoid flash of unstyled content.
+         This runs synchronously in <head> so the correct class is on <html>
+         before any CSS or body rendering occurs. -->
+    <script>
+    // Map an arbitrary locale string (zh-CN, en-US, fr ...) to 'zh' / 'zh-Hant' / 'en',
+    // or '' when unrecognized so callers can fall through to the next source.
+    window.__cowNormalizeLang__ = function(raw) {
+        if (!raw) return '';
+        var v = String(raw).trim().toLowerCase().replace('_', '-');
+        if (v === 'auto') return '';
+        // Handle Traditional Chinese variants first (more specific)
+        if (v === 'zh-hant' || v.indexOf('zh-hant-') === 0 || v === 'zh-tw' || v === 'zh-hk') return 'zh-Hant';
+        // Then Simplified Chinese
+        if (v.indexOf('zh') === 0) return 'zh';
+        if (v.indexOf('en') === 0) return 'en';
+        return '';
+    };
+    // Resolve the console language by priority:
+    //   user choice (localStorage) -> backend-detected -> browser -> 'zh'.
+    window.__cowResolveLang__ = function() {
+        return window.__cowNormalizeLang__(localStorage.getItem('cow_lang'))
+            || window.__cowNormalizeLang__(window.__COW_DEFAULT_LANG__)
+            || window.__cowNormalizeLang__(navigator.language || (navigator.languages && navigator.languages[0]))
+            || 'zh';
+    };
+    (function() {
+        // Backend-resolved default language (from cow_lang config / auto-detect).
+        window.__COW_DEFAULT_LANG__ = '{{COW_DEFAULT_LANG}}';
+        var theme = localStorage.getItem('cow_theme') || 'dark';
+        if (theme === 'dark') document.documentElement.classList.add('dark');
+        if (localStorage.getItem('cow_sidebar_collapsed') === '1') {
+            document.documentElement.classList.add('sidebar-collapsed');
+        }
+        // A customised menu is drawn by menu.js; keep the built-in one in
+        // sidebar.html from showing first. The timer is the way out should
+        // that script never run.
+        if (localStorage.getItem('cow_menu_cache')) {
+            document.documentElement.classList.add('menu-pending');
+            setTimeout(function () { document.documentElement.classList.remove('menu-pending'); }, 3000);
+        }
+        document.documentElement.setAttribute('lang', window.__cowResolveLang__());
+    })();
+    </script>
+</head>
+<body class="h-screen overflow-hidden bg-gray-50 dark:bg-[#111111] text-slate-800 dark:text-slate-200 font-sans">
+
+<!--#include templates/layout/login.html-->
+
+    <div id="app" class="flex h-screen">
+
+<!--#include templates/layout/sidebar.html-->
+
+<!--#include templates/layout/session-panel.html-->
+
+<!--#include templates/modals/team-chat.html-->
+
+        <!-- Mobile overlay for session panel (click to close) -->
+        <div id="session-panel-overlay" class="session-panel-overlay hidden" onclick="closeSessionPanel()"></div>
+
+        <!-- ================================================================ -->
+        <!-- MAIN CONTENT                                                     -->
+        <!-- ================================================================ -->
+        <div id="main-content" class="flex-1 flex flex-col min-w-0 h-screen">
+<!--#include templates/layout/header.html-->
+
+            <!-- Content Area -->
+            <div id="content-area" class="flex-1 overflow-hidden">
+
+<!--#include templates/views/chat.html-->
+
+<!--#include templates/views/artifacts.html-->
+
+<!--#include templates/views/agents.html-->
+
+<!--#include templates/views/config.html-->
+
+<!--#include templates/views/skills.html-->
+
+<!--#include templates/views/memory.html-->
+
+<!--#include templates/views/knowledge.html-->
+
+<!--#include templates/views/channels.html-->
+
+<!--#include templates/views/tasks.html-->
+
+<!--#include templates/views/logs.html-->
+
+<!--#include templates/views/custom.html-->
+
+            </div><!-- /content-area -->
+        </div><!-- /main-content -->
+    </div><!-- /app -->
+
+<!--#include templates/modals/knowledge-dialog.html-->
+
+<!--#include templates/modals/mcp-editor.html-->
+
+<!--#include templates/modals/skill-add.html-->
+
+<!--#include templates/modals/confirm-dialog.html-->
+
+<!--#include templates/modals/rename-dialog.html-->
+
+<!--#include templates/modals/folder-picker.html-->
+
+<!--#include templates/modals/vendor.html-->
+
+<!--#include templates/modals/custom-provider.html-->
+
+<!--#include templates/modals/task-edit.html-->
+
+<!--#include templates/modals/run-detail.html-->
+
+<!--#include templates/modals/menu-editor.html-->
+
+    <!-- Split out of a single console.js. These are classic scripts, not
+         modules: they share one global scope and `defer` runs them in this
+         order. The order is load-bearing - see channel/web/README.md before
+         adding, removing or moving a line. -->
+
+    <!-- doc-editor first: views/doc-viewers.js builds its editors at load time. -->
+    <script defer src="/assets/js/doc-editor.js"></script>
+
+    <script defer src="/assets/js/core/version.js"></script>
+    <script defer src="/assets/js/core/i18n.js"></script>
+    <script defer src="/assets/js/core/theme.js"></script>
+    <script defer src="/assets/js/core/utils.js"></script>
+    <script defer src="/assets/js/core/markdown.js"></script>
+    <script defer src="/assets/js/core/confirm.js"></script>
+    <script defer src="/assets/js/core/notify.js"></script>
+    <script defer src="/assets/js/core/nav.js"></script>
+    <!-- Right after nav.js: draws the sidebar at load time, and nav.js's
+         click handler and view switch call into it. -->
+    <script defer src="/assets/js/core/menu.js"></script>
+    <!-- After nav.js, whose navigateTo it drives and whose VIEW_META it
+         validates against. Only registers a popstate listener at load time;
+         the first route is applied from initApp(), once auth has settled. -->
+    <script defer src="/assets/js/core/router.js"></script>
+
+    <!-- Ahead of chat/, not with the other views: chat/state.js computes
+         sessionId at load time and activeSessionStorageKey() reads
+         defaultAgentId, which is a `let` declared here. Loading this later
+         puts that binding in its temporal dead zone, and chat/state.js dies
+         on the spot - taking the restored session, and so the visible
+         conversation history, with it. -->
+    <script defer src="/assets/js/views/agents.js"></script>
+
+    <script defer src="/assets/js/chat/state.js"></script>
+    <script defer src="/assets/js/chat/context-usage.js"></script>
+    <script defer src="/assets/js/chat/workspace-selector.js"></script>
+    <script defer src="/assets/js/chat/session-settings.js"></script>
+    <script defer src="/assets/js/chat/composer-input.js"></script>
+    <script defer src="/assets/js/chat/message-actions.js"></script>
+    <script defer src="/assets/js/chat/send.js"></script>
+    <script defer src="/assets/js/chat/scheduler-notify.js"></script>
+    <script defer src="/assets/js/chat/render.js"></script>
+    <script defer src="/assets/js/chat/timeline.js"></script>
+    <script defer src="/assets/js/chat/new-chat.js"></script>
+
+    <script defer src="/assets/js/views/sessions.js"></script>
+    <script defer src="/assets/js/views/config.js"></script>
+    <script defer src="/assets/js/views/models.js"></script>
+    <script defer src="/assets/js/views/models-custom-provider.js"></script>
+    <script defer src="/assets/js/views/channels.js"></script>
+    <script defer src="/assets/js/views/channels-weixin.js"></script>
+    <script defer src="/assets/js/views/channels-wecom.js"></script>
+    <script defer src="/assets/js/views/channels-feishu.js"></script>
+    <script defer src="/assets/js/views/tasks.js"></script>
+    <script defer src="/assets/js/views/tasks-modal.js"></script>
+    <script defer src="/assets/js/views/skills.js"></script>
+    <script defer src="/assets/js/views/memory.js"></script>
+    <script defer src="/assets/js/views/doc-viewers.js"></script>
+    <script defer src="/assets/js/views/knowledge.js"></script>
+    <script defer src="/assets/js/views/logs.js"></script>
+    <script defer src="/assets/js/views/artifacts.js"></script>
+    <script defer src="/assets/js/views/menu-editor.js"></script>
+
+    <!-- Last of the core layer rather than first, which is where it sat in
+         console.js. It installs a window.fetch wrapper for 401 handling, and
+         chat/state.js installs one that appends agent_id; keeping this one
+         outermost means the 401 check still sees the URL the caller passed. -->
+    <script defer src="/assets/js/core/auth.js"></script>
+
+    <!-- boot before workspace.js, which is where console.js used to sit:
+         applyI18n() probes for relocalizeWorkspacePanel with a typeof guard,
+         and it has always run before workspace.js defined it. -->
+    <script defer src="/assets/js/boot.js"></script>
+
+    <script defer src="/assets/js/workspace.js"></script>
+</body>
+</html>

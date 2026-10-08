@@ -1,0 +1,1028 @@
+import { app } from 'electron'
+import { ChildProcess, spawn, execFileSync } from 'child_process'
+import { EventEmitter } from 'events'
+import path from 'path'
+import os from 'os'
+import fs from 'fs'
+import http from 'http'
+import net from 'net'
+import crypto from 'crypto'
+
+// Writable data dir for the packaged app (config.json, run.log, user data).
+// Lives in the user's home so it survives app updates and avoids writing into
+// the read-only app bundle. Source/dev runs keep using the repo CWD instead.
+const COW_DATA_DIR = path.join(os.homedir(), '.cow')
+
+// Preferred port for the desktop backend. Deliberately not 9899 (the web
+// console's default) so a source-run `python app.py` never collides with the
+// packaged app. The renderer starts by probing this port, but it is only a
+// PREFERENCE, not a guarantee — see pickPort() for why, and note that the real
+// port is always published to the renderer via the 'port' event / whenPortReady.
+export const DESKTOP_BACKEND_PORT = 9876
+
+// Tried in order when the preferred port can't be bound. Windows reserves
+// pseudo-random port ranges for Hyper-V/WSL2/Docker (netsh "excluded port
+// range"): binding one fails with WinError 10013 even though nothing is
+// listening, so freePort() has nothing to kill and the old fixed-port design
+// left those users permanently stuck on "initializing". The candidates are
+// spread far apart so a single reserved block can't swallow all of them.
+const FALLBACK_PORTS = [19876, 29876, 39876, 49876, 55876]
+
+// How long the renderer may wait for the port decision before falling back to
+// the preferred port. Picking a port only involves local bind probes, so this
+// is a safety net against a hung probe, not a normal code path.
+const PORT_READY_TIMEOUT_MS = 15_000
+
+// Liveness supervision, active only AFTER the backend has been ready once.
+// Without it a backend that died or wedged hours later went unnoticed: the
+// shell kept reporting 'ready', the window looked fine, and every renderer
+// request failed with a bare "Failed to fetch".
+const HEALTH_PROBE_INTERVAL_MS = 15_000
+const HEALTH_PROBE_TIMEOUT_MS = 4_000
+// A miss must persist this long before we call the backend dead. Waking from
+// sleep loses the first probe (and stretches the interval), which must not be
+// mistaken for a crash.
+const HEALTH_GRACE_MS = 45_000
+// Restarts are bounded so a backend that dies immediately after every launch
+// becomes a reported error with a retry button, not an endless respawn loop.
+const MAX_RECOVERIES = 3
+const RECOVERY_WINDOW_MS = 10 * 60_000
+
+/**
+ * Why startup failed, as a stable identifier the renderer can map to specific,
+ * actionable advice. The raw message alone is not enough: "app.py not found at
+ * <install dir>" told a customer nothing, and the generic localized fallback
+ * ("the client failed to start") told them even less.
+ */
+export type BackendErrorCode =
+  // The bundle is installed but its executable is gone. On Windows this is
+  // essentially always antivirus quarantining the PyInstaller bootloader.
+  | 'backend_removed'
+  // Nothing usable is installed at the expected location.
+  | 'backend_missing'
+  // The executable is there but the OS refused to launch it.
+  | 'backend_blocked'
+  // It launched and then exited before ever answering.
+  | 'backend_crashed'
+  // It stayed alive but never answered /api/health.
+  | 'backend_timeout'
+  // It served requests, then stopped and could not be restarted.
+  | 'backend_unresponsive'
+
+export interface BackendError {
+  code: BackendErrorCode
+  /** Technical detail, shown verbatim; the renderer localizes from `code`. */
+  message: string
+  /** Path the failure is about (the missing executable, etc.), if any. */
+  path?: string
+}
+
+export class PythonBackend extends EventEmitter {
+  private process: ChildProcess | null = null
+  private backendPath: string
+  // Whether we're running inside an installed app (as opposed to a source
+  // checkout). Decided by the caller, NOT inferred from the bundle being
+  // present: inferring it meant that a quarantined executable silently
+  // demoted an installed app to "development mode", where it looked for
+  // app.py in the read-only install dir and wrote its log there too.
+  private packaged: boolean
+  private port: number = DESKTOP_BACKEND_PORT
+  private status: 'stopped' | 'starting' | 'ready' | 'error' = 'stopped'
+  // Resolves once start() has settled on a port. The renderer awaits this
+  // instead of assuming DESKTOP_BACKEND_PORT, so a fallback port is never a
+  // guess it has to make.
+  private portReady: Promise<number>
+  private markPortReady!: (port: number) => void
+  // Shared secret between this shell and the backend it spawns. Passed to the
+  // backend via COW_DESKTOP_TOKEN and echoed by the renderer on requests that
+  // only the desktop may make (importing an attachment by local path). Fixed
+  // for the life of the shell so a backend restart doesn't invalidate it.
+  private readonly desktopToken = crypto.randomBytes(24).toString('hex')
+  // Rolling tail of backend output. A startup that never reaches "ready" is
+  // otherwise reported as a bare timeout, and the actual cause (a bind error, a
+  // config exception) is only visible in run.log — which the user can't open
+  // from the UI, because the UI is exactly what failed to come up.
+  private recentLogs: string[] = []
+  // Post-ready liveness supervision. See startHealthMonitor().
+  private healthTimer: ReturnType<typeof setInterval> | null = null
+  private consecutiveHealthMisses = 0
+  private lastHealthyAt = 0
+  // True while we are deliberately tearing the process down (quit or restart),
+  // so neither the exit handler nor an in-flight probe treats it as a crash.
+  private shuttingDown = false
+  // True while a recovery restart is in progress, to keep it single-flight.
+  private recovering = false
+  private recoveryAttempts = 0
+  private recoveryWindowStart = 0
+  // Append stream to run.log so the backend's OWN stdout/stderr is persisted by
+  // the shell too. The backend writes run.log itself once its Python logging is
+  // up — but a bootstrap crash (missing DLL, broken onedir after an update,
+  // antivirus block) dies BEFORE that, spilling the real cause only to stderr.
+  // We captured that stderr already, but never wrote it anywhere durable, so the
+  // "open log folder" button showed a stale run.log with no trace of the crash.
+  // Mirroring here closes that gap without touching the Python side.
+  private logStream: fs.WriteStream | null = null
+  // The failure that put us in 'error', kept so it can be fetched later. The
+  // renderer subscribes to 'backend-status' only after React mounts, which is
+  // hundreds of milliseconds after launch — every error raised before that
+  // (and a missing executable is detected almost instantly) used to be emitted
+  // into the void, leaving the user with a bare "initialization failed".
+  private lastError: BackendError | null = null
+
+  constructor(backendPath: string, packaged = false) {
+    super()
+    this.backendPath = backendPath
+    this.packaged = packaged
+    this.portReady = new Promise<number>((resolve) => {
+      this.markPortReady = resolve
+    })
+  }
+
+  getPort(): number {
+    return this.port
+  }
+
+  /** The failure that put the backend in 'error', or null if none. */
+  getLastError(): BackendError | null {
+    return this.lastError
+  }
+
+  /**
+   * The port the backend will actually use, once known. Times out to the
+   * current best guess so a stalled startup can never leave the renderer
+   * waiting forever on a promise that never settles.
+   */
+  whenPortReady(): Promise<number> {
+    return Promise.race([
+      this.portReady,
+      new Promise<number>((resolve) => setTimeout(() => resolve(this.port), PORT_READY_TIMEOUT_MS)),
+    ])
+  }
+
+  /**
+   * Writable data dir the backend runs against (holds config.json + run.log),
+   * and the folder the failure screen's "open log folder" button reveals.
+   *
+   * Keyed on how the app was built, never on whether the bundle is currently
+   * intact: when the executable went missing this used to return the read-only
+   * install dir, so a user following the on-screen instructions opened a folder
+   * that had no run.log in it at all.
+   */
+  getDataDir(): string {
+    return this.packaged ? COW_DATA_DIR : this.backendPath
+  }
+
+  getDesktopToken(): string {
+    return this.desktopToken
+  }
+
+  // Optional fields of the bundled app-config forwarded to the backend:
+  // clientSource tags outbound requests for stats and appName is the name
+  // shown in command output.
+  private appConfigEnv(): Record<string, string> {
+    try {
+      const cfgPath = this.packaged
+        ? path.join(process.resourcesPath, 'app-config.json')
+        : path.resolve(__dirname, '../../resources', 'app-config.json')
+      const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8')) || {}
+      const env: Record<string, string> = {}
+      if (typeof cfg.clientSource === 'string' && cfg.clientSource.trim()) env.COW_CLIENT_SOURCE = cfg.clientSource.trim()
+      if (typeof cfg.appName === 'string' && cfg.appName.trim()) env.COW_APP_NAME = cfg.appName.trim()
+      if (typeof cfg.agentName === 'string' && cfg.agentName.trim()) env.DEFAULT_AGENT_NAME = cfg.agentName.trim()
+      return env
+    } catch {
+      return {}
+    }
+  }
+
+  getStatus(): string {
+    return this.status
+  }
+
+  private recordLog(line: string) {
+    this.recentLogs.push(line)
+    if (this.recentLogs.length > 80) {
+      this.recentLogs.shift()
+    }
+  }
+
+  /**
+   * Open an append stream to <dataDir>/run.log so we can persist the backend's
+   * stdout/stderr from the shell side. This is the same file the backend writes
+   * once its Python logging initializes, and the same file the "open log folder"
+   * button reveals — so a bootstrap crash's stderr lands exactly where the user
+   * (and we) already look. Best-effort: any failure just disables mirroring.
+   */
+  private openLogStream(dataDir: string): void {
+    this.closeLogStream()
+    try {
+      fs.mkdirSync(dataDir, { recursive: true })
+      const logPath = path.join(dataDir, 'run.log')
+      // Append (not truncate): the backend appends to this same file, so we must
+      // not clobber its history, and interleaving is fine — both are line-based.
+      this.logStream = fs.createWriteStream(logPath, { flags: 'a' })
+      // A logging error must never crash the app; drop the stream instead.
+      this.logStream.on('error', () => {
+        this.logStream = null
+      })
+      const stamp = new Date().toISOString()
+      this.logStream.write(`\n[SHELL][${stamp}] --- launching backend (stdout/stderr mirrored below) ---\n`)
+    } catch {
+      this.logStream = null
+    }
+  }
+
+  /**
+   * Write one line to run.log from the shell side, opening the file if the
+   * failure happened before (or instead of) a spawn. Everything we report to
+   * the user must also land here: the failure screen tells them to read
+   * run.log, so a diagnosis that exists only in an IPC message is a diagnosis
+   * they can never send us.
+   */
+  private writeLog(line: string): void {
+    if (!this.logStream) {
+      this.openLogStream(this.getDataDir())
+    }
+    try {
+      this.logStream?.write(`[SHELL][${new Date().toISOString()}] ${line}\n`)
+    } catch {
+      // ignore — logging must never break startup
+    }
+  }
+
+  /**
+   * Record a startup/liveness failure: remember it, persist it, and announce
+   * it. Single entry point so no failure can reach the user without also
+   * reaching run.log and getLastError().
+   */
+  private fail(code: BackendErrorCode, message: string, failedPath?: string): void {
+    this.status = 'error'
+    this.lastError = { code, message, ...(failedPath ? { path: failedPath } : {}) }
+    this.writeLog(`${code}: ${message}${failedPath ? ` [${failedPath}]` : ''}`)
+    // 'error' is special to EventEmitter: emitting it with no listener attached
+    // THROWS, which would turn "the backend didn't start" into "the main
+    // process died and no window ever appeared" — strictly worse than the
+    // failure we're trying to report. The failure is already stored and
+    // persisted, and the renderer pulls it via getLastError(), so skipping the
+    // emit loses nothing.
+    if (this.listenerCount('error') > 0) {
+      this.emit('error', this.lastError)
+    }
+  }
+
+  private closeLogStream(): void {
+    if (this.logStream) {
+      try {
+        this.logStream.end()
+      } catch {
+        // ignore
+      }
+      this.logStream = null
+    }
+  }
+
+  /**
+   * Append the most recent backend error line to a message, so the UI can show
+   * what actually went wrong instead of just "startup timed out".
+   */
+  private withLastError(message: string): string {
+    for (let i = this.recentLogs.length - 1; i >= 0; i--) {
+      const line = this.recentLogs[i]
+      if (/\[ERROR\]|Error:|OSError|Traceback/.test(line)) {
+        return `${message}: ${line.trim().slice(0, 300)}`
+      }
+    }
+    return message
+  }
+
+  // Cache the resolved PATH so we only spawn a login shell once per process.
+  private resolvedPath: string | null = null
+
+  /**
+   * Build the PATH the backend should run with.
+   *
+   * When launched from Finder/Dock, a GUI app inherits launchd's minimal PATH
+   * (/usr/bin:/bin:...) and never loads ~/.zshrc, so user-installed CLIs like
+   * `linkai`, `node`, or Homebrew tools are invisible to the agent's bash tool.
+   * We recover the real login-shell PATH (macOS/Linux) and merge in common bin
+   * dirs, so the agent can find these commands regardless of how the app started.
+   */
+  private resolveEnvPath(): string {
+    if (this.resolvedPath !== null) {
+      return this.resolvedPath
+    }
+
+    const sep = path.delimiter
+    const existing = process.env.PATH || ''
+    const parts: string[] = existing ? existing.split(sep) : []
+
+    // Prepend the bundled ripgrep dir (if shipped) so the search_files tool's
+    // shutil.which("rg") finds our copy and uses the fast rg backend instead of
+    // the slow PowerShell fallback. Only Windows ships rg today (macOS relies on
+    // its system grep); the existsSync guard keeps this a no-op everywhere else.
+    // backendPath is <resources>/backend, so rg lives one level up at
+    // <resources>/bin. First entry wins after de-dup below.
+    const rgDir = path.join(path.dirname(this.backendPath), 'bin')
+    const rgExe = process.platform === 'win32' ? 'rg.exe' : 'rg'
+    if (fs.existsSync(path.join(rgDir, rgExe))) {
+      parts.unshift(rgDir)
+    }
+
+    // Windows GUI apps already inherit the full system PATH; nothing to fix.
+    if (process.platform !== 'win32') {
+      // Ask the user's login shell for its PATH. `-ilc` runs an interactive
+      // login shell so it sources ~/.zshrc / ~/.zprofile etc.
+      try {
+        const shell = process.env.SHELL || '/bin/zsh'
+        const out = execFileSync(shell, ['-ilc', 'echo -n "__PATH__$PATH"'], {
+          encoding: 'utf8',
+          timeout: 5000,
+          stdio: ['ignore', 'pipe', 'ignore'],
+        })
+        const marker = out.lastIndexOf('__PATH__')
+        if (marker !== -1) {
+          const shellPath = out.slice(marker + '__PATH__'.length).trim()
+          if (shellPath) {
+            parts.push(...shellPath.split(sep))
+          }
+        }
+      } catch {
+        // Shell probe failed (unusual shell, timeout). Fall back to the
+        // common dirs below so at least the typical install paths work.
+      }
+
+      const home = os.homedir()
+      parts.push(
+        path.join(home, '.local/bin'),
+        '/usr/local/bin',
+        '/opt/homebrew/bin',
+        '/usr/bin',
+        '/bin',
+        '/usr/sbin',
+        '/sbin',
+      )
+    }
+
+    // De-duplicate while preserving order (first occurrence wins).
+    const seen = new Set<string>()
+    const merged: string[] = []
+    for (const p of parts) {
+      const dir = p.trim()
+      if (dir && !seen.has(dir)) {
+        seen.add(dir)
+        merged.push(dir)
+      }
+    }
+
+    this.resolvedPath = merged.join(sep)
+    return this.resolvedPath
+  }
+
+  /**
+   * Inspect the packaged onedir backend on disk.
+   *
+   * `hasPayload` (the PyInstaller support files: _internal, DLLs, base_library)
+   * is reported separately from `hasExe` on purpose. Antivirus quarantine
+   * deletes ONLY the bootloader executable — it matches the heuristic, the
+   * hundreds of DLLs beside it do not — so "payload intact, executable gone" is
+   * a signature we can recognise and explain, rather than a generic failure.
+   */
+  private inspectBundle(): { exePath: string; hasExe: boolean; hasPayload: boolean } {
+    const exeName = process.platform === 'win32' ? 'cowagent-backend.exe' : 'cowagent-backend'
+    const dirs = [path.join(this.backendPath, 'cowagent-backend'), this.backendPath]
+    for (const dir of dirs) {
+      const exePath = path.join(dir, exeName)
+      const hasExe = fs.existsSync(exePath)
+      let hasPayload = false
+      try {
+        hasPayload = fs.readdirSync(dir).some((entry) => entry !== exeName)
+      } catch {
+        // Directory missing/unreadable — leave hasPayload false.
+      }
+      if (hasExe || hasPayload) {
+        return { exePath, hasExe, hasPayload }
+      }
+    }
+    return { exePath: path.join(dirs[0], exeName), hasExe: false, hasPayload: false }
+  }
+
+  /**
+   * Path to the packaged backend executable, or null when it isn't there
+   * (a source checkout, or an install whose executable was removed).
+   */
+  private findBundledBackend(): string | null {
+    const bundle = this.inspectBundle()
+    return bundle.hasExe ? bundle.exePath : null
+  }
+
+  private findPython(): string {
+    const venvPaths = [
+      path.join(this.backendPath, '.venv', 'bin', 'python'),
+      path.join(this.backendPath, '.venv', 'Scripts', 'python.exe'),
+      path.join(this.backendPath, 'venv', 'bin', 'python'),
+      path.join(this.backendPath, 'venv', 'Scripts', 'python.exe'),
+    ]
+
+    for (const p of venvPaths) {
+      if (fs.existsSync(p)) {
+        return p
+      }
+    }
+
+    return process.platform === 'win32' ? 'python' : 'python3'
+  }
+
+  /**
+   * Read an explicit `web_port` from config.json, if the user pinned one. The
+   * packaged build keeps config in COW_DATA_DIR (~/.cow); dev reads it from the
+   * repo path. Returns null when unset, so the caller can auto-pick a free port
+   * instead of fighting over a fixed one.
+   */
+  private readConfiguredPort(dataDir: string): number | null {
+    try {
+      const configPath = path.join(dataDir, 'config.json')
+      if (fs.existsSync(configPath)) {
+        const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'))
+        const p = Number(config.web_port)
+        if (Number.isInteger(p) && p > 0 && p < 65536) {
+          return p
+        }
+      }
+    } catch {
+      // ignore — fall through to auto-selection
+    }
+    return null
+  }
+
+  /**
+   * Pick a port the backend can actually bind, preferring the pinned/default
+   * one. Each candidate is probed for real (bind + close); a busy one gets a
+   * freePort() pass first, since the usual cause is a stale backend from a
+   * previous run. Anything still unusable is skipped rather than fought over:
+   * on Windows a port can be permanently unbindable (reserved by Hyper-V/WSL2)
+   * with no process to kill, which used to strand the app on "initializing".
+   *
+   * The result is the single source of truth handed to both the backend
+   * (COW_WEB_PORT) and the renderer (whenPortReady / the 'port' event).
+   */
+  private async pickPort(dataDir: string): Promise<number> {
+    const pinned = this.readConfiguredPort(dataDir)
+    const preferred = pinned !== null ? pinned : DESKTOP_BACKEND_PORT
+    const candidates = [preferred, ...FALLBACK_PORTS.filter((p) => p !== preferred)]
+
+    for (const port of candidates) {
+      if (await this.isPortFree(port)) {
+        return port
+      }
+      await this.freePort(port)
+      if (await this.isPortFree(port)) {
+        return port
+      }
+      this.emit('log', `Port ${port} is unusable — trying the next candidate`)
+    }
+
+    // Every candidate refused. Let the OS name a free port: it's less stable
+    // across restarts, but the renderer is told which one, so it still works.
+    const ephemeral = await this.findEphemeralPort()
+    if (ephemeral) {
+      this.emit('log', `All candidate ports refused — using OS-assigned port ${ephemeral}`)
+      return ephemeral
+    }
+    // Nothing bindable at all. Return the preferred port anyway so the backend
+    // runs and logs a real bind error instead of us failing silently here.
+    return preferred
+  }
+
+  /** Ask the OS for any free loopback port. Null if even that fails. */
+  private findEphemeralPort(): Promise<number | null> {
+    return new Promise((resolve) => {
+      const tester = net
+        .createServer()
+        .once('error', () => resolve(null))
+        .once('listening', () => {
+          const addr = tester.address()
+          const port = addr && typeof addr === 'object' ? addr.port : null
+          tester.close(() => resolve(port))
+        })
+        .listen(0, '127.0.0.1')
+    })
+  }
+
+  /** True if we can bind 127.0.0.1:port right now (i.e. it's free). */
+  private isPortFree(port: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const tester = net
+        .createServer()
+        .once('error', () => resolve(false))
+        .once('listening', () => {
+          tester.close(() => resolve(true))
+        })
+        .listen(port, '127.0.0.1')
+    })
+  }
+
+  /**
+   * Make sure our fixed port is usable before launch by killing whatever is
+   * holding it (almost always a stale backend from a previous run that didn't
+   * shut down cleanly). We only ever target a process actually listening on
+   * 127.0.0.1:<port>, so we won't touch unrelated apps. Best-effort: if we
+   * can't free it we still try to bind and let the backend surface EADDRINUSE.
+   */
+  private async freePort(port: number): Promise<void> {
+    if (await this.isPortFree(port)) {
+      return
+    }
+    this.emit('log', `Port ${port} is busy — clearing stale process before launch`)
+    const pids = await this.findListenerPids(port)
+    for (const pid of pids) {
+      // Never signal ourselves (Electron could, in theory, be the listener).
+      if (pid === process.pid) continue
+      try {
+        process.kill(pid, 'SIGTERM')
+      } catch {
+        // already gone / no permission — ignore
+      }
+    }
+    // Give the OS a beat to release the socket, then force-kill leftovers.
+    await new Promise((r) => setTimeout(r, 600))
+    if (!(await this.isPortFree(port))) {
+      for (const pid of await this.findListenerPids(port)) {
+        if (pid === process.pid) continue
+        try {
+          process.kill(pid, 'SIGKILL')
+        } catch {
+          // ignore
+        }
+      }
+      await new Promise((r) => setTimeout(r, 400))
+    }
+  }
+
+  /** PIDs listening on 127.0.0.1:<port>, via lsof (POSIX) / netstat (Windows). */
+  private findListenerPids(port: number): Promise<number[]> {
+    return new Promise((resolve) => {
+      const isWin = process.platform === 'win32'
+      const cmd = isWin ? 'netstat' : 'lsof'
+      const args = isWin
+        ? ['-ano', '-p', 'tcp']
+        : ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t']
+      let out = ''
+      try {
+        const child = spawn(cmd, args)
+        child.stdout?.on('data', (d: Buffer) => (out += d.toString()))
+        child.on('error', () => resolve([]))
+        child.on('close', () => {
+          const pids = new Set<number>()
+          if (isWin) {
+            // Match lines like: TCP 127.0.0.1:9876 ... LISTENING  12345
+            for (const line of out.split('\n')) {
+              if (!/LISTENING/i.test(line)) continue
+              if (!new RegExp(`[:.]${port}\\b`).test(line)) continue
+              const pid = Number(line.trim().split(/\s+/).pop())
+              if (Number.isInteger(pid) && pid > 0) pids.add(pid)
+            }
+          } else {
+            for (const tok of out.split(/\s+/)) {
+              const pid = Number(tok)
+              if (Number.isInteger(pid) && pid > 0) pids.add(pid)
+            }
+          }
+          resolve([...pids])
+        })
+      } catch {
+        resolve([])
+      }
+    })
+  }
+
+  /** One-shot /api/health probe. Never throws; false means "unreachable". */
+  private probeHealth(): Promise<boolean> {
+    return new Promise((resolve) => {
+      let settled = false
+      const done = (ok: boolean) => {
+        if (settled) return
+        settled = true
+        resolve(ok)
+      }
+      const req = http.get(`http://127.0.0.1:${this.port}/api/health`, (res) => {
+        // Drain the body: an unread response keeps its socket checked out of
+        // the keep-alive pool, so repeated probes would leak sockets.
+        res.resume()
+        done(res.statusCode === 200)
+      })
+      req.on('error', () => done(false))
+      req.setTimeout(HEALTH_PROBE_TIMEOUT_MS, () => {
+        req.destroy()
+        done(false)
+      })
+    })
+  }
+
+  /**
+   * Start watching a backend that has reached 'ready'. The renderer trusts
+   * 'ready' for the rest of the session, so this is the only thing that can
+   * notice a backend which dies or stops answering later on.
+   */
+  private startHealthMonitor(): void {
+    this.stopHealthMonitor()
+    this.lastHealthyAt = Date.now()
+    this.consecutiveHealthMisses = 0
+    this.healthTimer = setInterval(() => {
+      void this.checkHealth()
+    }, HEALTH_PROBE_INTERVAL_MS)
+  }
+
+  private stopHealthMonitor(): void {
+    if (this.healthTimer) {
+      clearInterval(this.healthTimer)
+      this.healthTimer = null
+    }
+  }
+
+  private async checkHealth(): Promise<void> {
+    if (this.shuttingDown || this.recovering) {
+      return
+    }
+    if (await this.probeHealth()) {
+      this.consecutiveHealthMisses = 0
+      this.lastHealthyAt = Date.now()
+      return
+    }
+    this.consecutiveHealthMisses++
+    // Require both repeated misses and real elapsed time: sleep/wake throttles
+    // the interval, so a single lost probe says nothing about the backend.
+    if (this.consecutiveHealthMisses < 2 || Date.now() - this.lastHealthyAt < HEALTH_GRACE_MS) {
+      return
+    }
+    await this.recover()
+  }
+
+  /**
+   * Rebuild a backend that stopped answering. Announces 'lost' first so the
+   * renderer drops its cached "ready" and shows the reconnect screen instead of
+   * failing every request behind an intact-looking UI.
+   */
+  private async recover(): Promise<void> {
+    if (this.recovering) {
+      return
+    }
+    this.recovering = true
+    this.stopHealthMonitor()
+    try {
+      // Announced before the budget check: the backend is gone either way, and
+      // the renderer must leave 'ready' even on the attempt where we give up —
+      // otherwise it would ignore the error we're about to report.
+      this.emit('lost')
+      const now = Date.now()
+      if (now - this.recoveryWindowStart > RECOVERY_WINDOW_MS) {
+        this.recoveryWindowStart = now
+        this.recoveryAttempts = 0
+      }
+      this.recoveryAttempts++
+      if (this.recoveryAttempts > MAX_RECOVERIES) {
+        this.fail(
+          'backend_unresponsive',
+          this.withLastError('The app stopped responding and could not be restarted'),
+        )
+        return
+      }
+      this.emit(
+        'log',
+        `Backend stopped responding — restarting (attempt ${this.recoveryAttempts}/${MAX_RECOVERIES})`,
+      )
+      await this.restart()
+    } finally {
+      this.recovering = false
+    }
+  }
+
+  async start(): Promise<void> {
+    if (this.status === 'ready' || this.status === 'starting') {
+      return
+    }
+
+    this.shuttingDown = false
+    this.status = 'starting'
+    // Drop the previous run's output so a retry can't report a stale error.
+    this.recentLogs = []
+    this.lastError = null
+
+    // Packaged app stores writable data in ~/.cow; dev keeps it in the repo.
+    const dataDir = this.getDataDir()
+
+    // Start mirroring backend output to run.log before we spawn, so even an
+    // instant bootstrap crash (before Python logging is up) leaves its stderr
+    // in the file the user can open from the failure screen.
+    this.openLogStream(dataDir)
+
+    // Prefer the packaged self-contained backend (production); fall back to
+    // running app.py with a Python interpreter (local development).
+    const bundle = this.inspectBundle()
+    const bundled = bundle.hasExe ? bundle.exePath : null
+
+    // An installed app has no other way to run: there is no source tree and no
+    // Python to fall back to. Say so now, naming the file that is missing, and
+    // resolve the port promise so nothing downstream waits on a launch that
+    // will never happen. Previously this fell through to the development
+    // branch and reported "app.py not found at <install dir>" — a message that
+    // described our own fallback rather than the user's actual problem.
+    if (!bundled && this.packaged) {
+      this.markPortReady(this.port)
+      if (bundle.hasPayload) {
+        this.fail(
+          'backend_removed',
+          'The backend executable is missing while the rest of its files are intact, which is what antivirus quarantine looks like',
+          bundle.exePath,
+        )
+      } else {
+        this.fail('backend_missing', 'The backend is not present in this installation', bundle.exePath)
+      }
+      return
+    }
+
+    // Always launch our OWN backend (re-entrancy is guarded above by the status
+    // check, so we never double-spawn for this instance). We don't reuse
+    // whatever happens to be on the port: that's how the app previously attached
+    // to a source-run web console and read the wrong config. pickPort() frees
+    // stale listeners and skips ports the OS refuses, then publishes the result
+    // so the renderer never has to guess which port we settled on.
+    this.port = await this.pickPort(dataDir)
+    this.markPortReady(this.port)
+    this.emit('port', this.port)
+
+    let command: string
+    let args: string[]
+    let cwd: string
+
+    if (bundled) {
+      command = bundled
+      args = []
+      // Run from the writable data dir (~/.cow), NOT the install dir. When the
+      // app is installed under Program Files, a non-admin user has no write
+      // permission to the executable's folder, so any relative-path write
+      // during startup would crash the backend (works only as admin). The
+      // bundle reads its read-only resources via sys._MEIPASS, so cwd is free
+      // to point elsewhere.
+      try {
+        fs.mkdirSync(COW_DATA_DIR, { recursive: true })
+      } catch {
+        // ignore — get_data_root() also ensures the dir on the Python side
+      }
+      cwd = COW_DATA_DIR
+      this.emit('log', `Starting bundled backend: ${bundled} (cwd=${cwd})`)
+    } else {
+      const pythonPath = this.findPython()
+      const appPath = path.join(this.backendPath, 'app.py')
+      if (!fs.existsSync(appPath)) {
+        this.fail('backend_missing', 'app.py not found — this is a source checkout with no backend', appPath)
+        return
+      }
+      command = pythonPath
+      args = [appPath]
+      cwd = this.backendPath
+      this.emit('log', `Starting Python backend: ${pythonPath} ${appPath}`)
+    }
+
+    this.process = spawn(command, args, {
+      cwd,
+      // COW_DESKTOP enables the lighter desktop runtime (no plugins, no MCP).
+      // COW_DATA_DIR (packaged only) redirects writable data to ~/.cow so the
+      // app bundle stays read-only; dev runs omit it and keep using the repo.
+      env: {
+        ...process.env,
+        // Recover the user's real PATH (login shell + common bin dirs) so the
+        // agent's bash tool can find CLIs like `linkai`/`node` even when the
+        // app is launched from Finder/Dock with launchd's minimal PATH.
+        PATH: this.resolveEnvPath(),
+        PYTHONUNBUFFERED: '1',
+        COW_DESKTOP: '1',
+        // The shell owns the port: tell the backend to bind exactly here so the
+        // two sides can never disagree (and we avoid the 9899 web-console clash).
+        COW_WEB_PORT: String(this.port),
+        COW_DESKTOP_TOKEN: this.desktopToken,
+        ...(bundled ? { COW_DATA_DIR } : {}),
+        ...this.appConfigEnv(),
+        COW_CLIENT_VERSION: app.getVersion(),
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+
+    const onOutput = (data: Buffer) => {
+      const text = data.toString()
+      // Mirror to run.log ONLY before the backend is ready. Once Python's own
+      // logging is up it writes every line to this same file via its FileHandler,
+      // so mirroring the same stdout here would duplicate every line. Before that
+      // (bootstrap crash: missing DLL, broken onedir, antivirus block) Python
+      // logging isn't running yet, and this is the only thing that captures the
+      // real cause — the reason this mirror exists at all.
+      if (this.logStream && this.status !== 'ready') {
+        try {
+          this.logStream.write(text)
+        } catch {
+          // ignore — logging must never break startup
+        }
+      }
+      const lines = text.split('\n').filter(Boolean)
+      for (const line of lines) {
+        this.recordLog(line)
+        this.emit('log', line)
+      }
+    }
+    this.process.stdout?.on('data', onOutput)
+    this.process.stderr?.on('data', onOutput)
+
+    this.process.on('exit', (code) => {
+      // If the backend dies before it ever became ready, surface an error now
+      // instead of letting waitForReady spin for the full timeout. A clean exit
+      // (code 0/null, e.g. our own stop()) just marks stopped.
+      const wasReady = this.status === 'ready'
+      this.status = 'stopped'
+      if (this.logStream) {
+        try {
+          this.logStream.write(`[SHELL][${new Date().toISOString()}] backend process exited with code ${code}\n`)
+        } catch {
+          // ignore
+        }
+      }
+      this.emit('log', `Python process exited with code ${code}`)
+      if (!wasReady && code !== 0 && code !== null) {
+        this.fail('backend_crashed', this.withLastError(`The app exited during startup (code ${code})`))
+        return
+      }
+      // Died after serving requests (a late crash, or app.py's own os._exit).
+      // Nothing else would notice, so recover here rather than waiting out the
+      // next health probe.
+      if (wasReady && !this.shuttingDown) {
+        this.stopHealthMonitor()
+        void this.recover()
+      }
+    })
+
+    this.process.on('error', (err) => {
+      if (bundled) {
+        // The executable was there when we checked a moment ago. ENOENT means
+        // it vanished in between (a scanner deleting it as we launched);
+        // EACCES/EPERM means something refused to let it run. From the user's
+        // side these are the same problem: security software is in the way.
+        this.fail('backend_blocked', `The backend could not be launched: ${err.message}`, bundled)
+      } else {
+        this.fail('backend_missing', `Failed to start Python: ${err.message}`, command)
+      }
+    })
+
+    await this.waitForReady()
+  }
+
+  private waitForReady(): Promise<void> {
+    return new Promise((resolve) => {
+      // Wall-clock deadline rather than an attempt counter: if the machine
+      // sleeps/suspends, the 1s timers stretch out and a counter would give up
+      // far too early. Time-based bounding tracks real elapsed time instead.
+      // Only reachable when the process is alive yet never answers /api/health:
+      // a crash exits immediately and a wedged startup is killed by the
+      // backend's own watchdog, and both paths report a real cause. So this is
+      // a backstop, kept just above that watchdog so its message wins the race.
+      const timeoutMs = 30_000
+      const startedAt = Date.now()
+
+      const check = () => {
+        // Probe the unauthenticated health endpoint, NOT /config: /config
+        // requires auth once a web_password is set, which would make this poll
+        // 401 forever and hang startup.
+        const req = http.get(`http://127.0.0.1:${this.port}/api/health`, (res) => {
+          // Drain the body so the socket isn't held out of the keep-alive pool.
+          res.resume()
+          if (res.statusCode === 200) {
+            this.status = 'ready'
+            this.emit('log', `Backend ready on port ${this.port}`)
+            this.emit('ready', this.port)
+            // From here on the renderer trusts 'ready', so this monitor is the
+            // only thing that can notice the backend going away later.
+            this.startHealthMonitor()
+            resolve()
+          } else {
+            retry()
+          }
+        })
+
+        req.on('error', () => retry())
+        req.setTimeout(2000, () => {
+          req.destroy()
+          retry()
+        })
+      }
+
+      const retry = () => {
+        // Backend already settled: ready (done), or stopped/errored by the exit
+        // handler (don't keep polling a dead process — the error was emitted).
+        if (this.status === 'ready' || this.status === 'stopped' || this.status === 'error') {
+          resolve()
+          return
+        }
+        if (Date.now() - startedAt >= timeoutMs) {
+          this.fail(
+            'backend_timeout',
+            this.withLastError(`The app failed to start within ${Math.round(timeoutMs / 1000)} seconds`),
+          )
+          resolve()
+          return
+        }
+        setTimeout(check, 1000)
+      }
+
+      setTimeout(check, 2000)
+    })
+  }
+
+  stop(): void {
+    // Set before the kill so the exit handler reads this as a deliberate
+    // teardown and doesn't try to "recover" a process we just asked to die.
+    this.shuttingDown = true
+    this.stopHealthMonitor()
+    this.closeLogStream()
+    const proc = this.process
+    if (proc) {
+      proc.kill('SIGTERM')
+      // Keep a local ref so the SIGKILL fallback can still reach the process
+      // even after we clear `this.process`; otherwise a stuck backend would
+      // never be force-killed and leak as a zombie.
+      setTimeout(() => {
+        if (!proc.killed) {
+          proc.kill('SIGKILL')
+        }
+      }, 5000)
+      this.process = null
+    }
+    this.status = 'stopped'
+  }
+
+  /**
+   * Synchronously, forcefully tear the backend down and BLOCK until its files
+   * are no longer held. Used only on the update-install path: the NSIS silent
+   * updater starts deleting the old install almost immediately, and on Windows a
+   * still-running cowagent-backend.exe (plus the hundreds of DLLs it maps from
+   * _internal) keeps those files locked, so the installer aborts with "卸载旧
+   * 应用程序文件失败:2". The normal stop() only sends SIGTERM and returns before
+   * the process is actually gone — which on Windows is a no-op for a native exe.
+   *
+   * Best-effort throughout: any failure here must never block the update, so we
+   * still fall through to quitAndInstall even if the kill didn't fully succeed.
+   */
+  stopSync(): void {
+    this.shuttingDown = true
+    this.stopHealthMonitor()
+    this.closeLogStream()
+    const proc = this.process
+    this.process = null
+    this.status = 'stopped'
+    const pid = proc?.pid
+    if (process.platform === 'win32') {
+      // SIGTERM/SIGKILL are effectively meaningless for a native Windows exe, so
+      // use taskkill to end the whole process TREE (/T) forcibly (/F). This
+      // reaches child processes the backend may have spawned (rg.exe, agent bash
+      // tool, etc.) that would otherwise keep files locked. taskkill is
+      // synchronous, so once it returns the handles are released.
+      try {
+        if (pid) {
+          execFileSync('taskkill', ['/pid', String(pid), '/T', '/F'], {
+            stdio: 'ignore',
+            timeout: 5000,
+          })
+        }
+      } catch {
+        // already gone / access denied — fall through to the by-name sweep
+      }
+      // Belt-and-suspenders: kill any stray backend by image name too, in case
+      // the tree walk missed a re-parented child. Scoped to our exe name so it
+      // can't touch unrelated processes.
+      try {
+        execFileSync('taskkill', ['/im', 'cowagent-backend.exe', '/T', '/F'], {
+          stdio: 'ignore',
+          timeout: 5000,
+        })
+      } catch {
+        // no such process / nothing to do
+      }
+    } else if (proc) {
+      // POSIX: SIGKILL is immediate and reliable; no file-lock concern for the
+      // in-place bundle swap, but we still want the child gone before we quit.
+      try {
+        proc.kill('SIGKILL')
+      } catch {
+        // already gone — ignore
+      }
+    }
+  }
+
+  async restart(): Promise<void> {
+    // A manual retry from the UI earns a fresh recovery budget; a restart that
+    // the recovery path itself triggered must keep counting toward the limit.
+    if (!this.recovering) {
+      this.recoveryAttempts = 0
+      this.recoveryWindowStart = Date.now()
+    }
+    this.stop()
+    await new Promise((resolve) => setTimeout(resolve, 2000))
+    await this.start()
+  }
+}

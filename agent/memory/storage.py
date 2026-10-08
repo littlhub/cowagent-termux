@@ -1,0 +1,1267 @@
+"""
+Storage layer for memory using SQLite + FTS5
+
+Provides vector and keyword search capabilities
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import sqlite3
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from agent.memory.vector_backend import (
+    SQLiteVectorBackend,
+    VectorBackend,
+    VectorRecord,
+)
+
+try:
+    import numpy as np
+    _HAS_NUMPY = True
+except ImportError:
+    _HAS_NUMPY = False
+    np = None  # type: ignore[assignment]
+
+# UPSERT (INSERT … ON CONFLICT DO UPDATE) requires SQLite ≥ 3.24.0 (2018).
+# Older systems (e.g. CentOS 7 ships SQLite 3.7) fall back to INSERT OR REPLACE,
+# which risks FTS5 rowid drift on chunk updates (see save_chunk docstring).
+_HAS_UPSERT = sqlite3.sqlite_version_info >= (3, 24, 0)
+
+# ---------------------------------------------------------------------------
+# CJK character ranges, compiled once at module load.
+# Covers: CJK Symbols/Punctuation, Japanese kana (hiragana + katakana),
+#         CJK Unified Ideographs + Extension A, Korean syllables (Hangul),
+#         CJK Compatibility Ideographs, and CJK Extension B–F.
+# ---------------------------------------------------------------------------
+_CJK_RANGES = (
+    r'\u3000-\u30ff'          # CJK Symbols/Punctuation + Japanese kana
+    r'\u3400-\u9fff'          # CJK Unified Ideographs (incl. Extension A)
+    r'\uac00-\ud7af'          # Korean syllables (Hangul)
+    r'\uf900-\ufaff'          # CJK Compatibility Ideographs
+    r'\U00020000-\U0002fa1f'  # CJK Extension B–F
+)
+_RE_CONTAINS_CJK   = re.compile(f'[{_CJK_RANGES}]')
+_RE_CJK_WORDS      = re.compile(f'[{_CJK_RANGES}]+')
+_RE_TRIGRAM_TOKENS = re.compile(rf'[{_CJK_RANGES}]+|[^\W{_CJK_RANGES}]+')
+
+# sqlite3.OperationalError subclasses DatabaseError, so "database is locked",
+# "disk I/O error" and friends must be told apart from actual corruption before
+# any recovery is attempted.
+_CORRUPTION_MARKERS = ("malformed", "corrupt", "file is not a database", "encrypted")
+
+
+# Every session's first message opens this database, so nothing that reads the
+# whole index (the integrity scan, rebuilding a search index) runs on the open
+# path: it runs in the background, once per process, and never moves the file.
+_maintenance_started: set = set()
+_maintenance_running: set = set()
+_maintenance_lock = threading.Lock()
+# Chunk writes and a background index rebuild must not interleave, so every
+# MemoryStorage on the same file shares one write lock.
+_write_locks: Dict[str, threading.RLock] = {}
+
+_FTS_REBUILD_PENDING = "fts_rebuild_pending"
+_TRIGRAM_DONE = "trigram_backfill_done"
+# Rows per transaction when refilling a search index, so the write lock on the
+# shared file (which also holds the conversation history) is released often.
+_REFILL_BATCH = 500
+
+
+def _write_lock_for(key: str) -> threading.RLock:
+    with _maintenance_lock:
+        return _write_locks.setdefault(key, threading.RLock())
+
+
+def _is_corruption_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _CORRUPTION_MARKERS)
+
+
+def _split_fts5_damage(report: str) -> tuple[list[str], list[str]]:
+    """Split an integrity_check report into FTS5 findings and everything else.
+
+    SQLite 3.44 taught integrity_check to validate FTS3/FTS5 content too, so a
+    merely stale search index now shows up as a failure. Those indexes are
+    derived data and get rebuilt from the chunks table, whereas other findings
+    mean the b-tree itself is damaged.
+    """
+    fts5, other = [], []
+    for line in report.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        (fts5 if "fts5" in line.lower() else other).append(line)
+    return fts5, other
+
+
+@dataclass
+class MemoryChunk:
+    """Represents a memory chunk with text and embedding"""
+    id: str
+    user_id: Optional[str]
+    scope: str  # "shared" | "user" | "session"
+    source: str  # "memory" | "session"
+    path: str
+    start_line: int
+    end_line: int
+    text: str
+    embedding: Optional[List[float]]
+    hash: str
+    metadata: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class SearchResult:
+    """Search result with score and snippet"""
+    path: str
+    start_line: int
+    end_line: int
+    score: float
+    snippet: str
+    source: str
+    user_id: Optional[str] = None
+
+
+class MemoryStorage:
+    """SQLite-based storage with FTS5 for keyword search"""
+    
+    def __init__(
+        self,
+        db_path: Path,
+        vector_backend: Optional[VectorBackend] = None,
+    ):
+        self.db_path = db_path
+        self.conn: Optional[sqlite3.Connection] = None
+        self.vector_backend = vector_backend
+        self.fts5_available = False  # Track FTS5 availability
+        # RLock protects concurrent writes from the same process.
+        # SQLite WAL mode handles read/write concurrency at the file level,
+        # but same-process concurrent writes still need a Python-level lock.
+        self._lock = _write_lock_for(str(db_path))
+        self._init_db()
+        if self.vector_backend is None:
+            assert self.conn is not None
+            self.vector_backend = SQLiteVectorBackend(self.conn)
+    
+    def _check_fts5_support(self) -> bool:
+        """Check if SQLite has FTS5 support"""
+        try:
+            self.conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS fts5_test USING fts5(test)")
+            self.conn.execute("DROP TABLE IF EXISTS fts5_test")
+            return True
+        except sqlite3.OperationalError as e:
+            if "no such module: fts5" in str(e):
+                return False
+            raise
+
+    def _open_conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        try:
+            conn.row_factory = sqlite3.Row
+            # WAL and busy_timeout must be set before any long read (notably
+            # integrity_check), otherwise a concurrent writer makes it fail with
+            # SQLITE_BUSY, which used to be misread as corruption.
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+        except Exception:
+            conn.close()
+            raise
+        return conn
+
+    def _schedule_maintenance(self, repair_pending: bool):
+        """Start background maintenance: repair flagged search indexes and, once
+        per process, scan the file for damage.
+
+        The scan reads the whole file (minutes for a large one on a network
+        filesystem). This file also holds the conversation history, which
+        cannot be regenerated, so what the scan finds is never repaired by
+        moving the file away:
+          - FTS5 damage is rebuilt in place from the chunks table (the index is
+            derived data).
+          - Any other damage is only logged, for manual repair.
+        Set ``memory_integrity_check: true`` in config.json for the full
+        ``integrity_check`` instead of ``quick_check``.
+        """
+        key = str(self.db_path)
+        with _maintenance_lock:
+            scan = key not in _maintenance_started
+            if key in _maintenance_running or not (scan or repair_pending):
+                return
+            _maintenance_started.add(key)
+            _maintenance_running.add(key)
+        threading.Thread(
+            target=self._run_maintenance, args=(key, scan),
+            daemon=True, name="memory-db-maintenance",
+        ).start()
+
+    def _run_maintenance(self, key: str, scan: bool):
+        from common.log import logger
+        conn = None
+        try:
+            conn = self._open_conn()
+            self._repair_search_indexes(conn)
+            if scan:
+                self._scan_integrity(conn, key)
+        except Exception as e:
+            logger.warning(f"[MemoryStorage] Background maintenance of {key} failed: {e}")
+        finally:
+            if conn is not None:
+                conn.close()
+            with _maintenance_lock:
+                _maintenance_running.discard(key)
+
+    def _scan_integrity(self, conn: sqlite3.Connection, key: str):
+        from common.log import logger
+        report = self._integrity_report(conn)
+        if report is None:
+            return
+        fts5_lines, other_lines = _split_fts5_damage(report)
+        if fts5_lines:
+            logger.warning(
+                f"[MemoryStorage] FTS5 index damaged, rebuilding from chunks: "
+                f"{'; '.join(fts5_lines)}"
+            )
+            trigram = any("chunks_fts_trigram" in ln for ln in fts5_lines)
+            unicode = any(
+                "chunks_fts" in ln and "chunks_fts_trigram" not in ln for ln in fts5_lines
+            )
+            if not (trigram or unicode):
+                trigram = unicode = True
+            with conn:
+                if unicode:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO _meta(key, value) VALUES(?, '1')",
+                        (_FTS_REBUILD_PENDING,),
+                    )
+                if trigram:
+                    conn.execute("DELETE FROM _meta WHERE key = ?", (_TRIGRAM_DONE,))
+            self._repair_search_indexes(conn)
+        if other_lines:
+            logger.error(
+                f"[MemoryStorage] Database damage found in {key}, left in place "
+                f"(repair manually, e.g. sqlite3 .recover): {'; '.join(other_lines)}"
+            )
+
+    @staticmethod
+    def _integrity_report(conn: sqlite3.Connection) -> Optional[str]:
+        """Run the check; None when the database is fine or could not be checked."""
+        from common.log import logger
+        pragma = "quick_check"
+        try:
+            from config import conf
+            if conf().get("memory_integrity_check", False):
+                pragma = "integrity_check"
+        except Exception:
+            # No config available (tests / standalone) — keep the historical
+            # behaviour of running the full scan.
+            pragma = "integrity_check"
+        try:
+            rows = conn.execute(f"PRAGMA {pragma}").fetchall()
+            report = "\n".join(str(r[0]) for r in rows).strip()
+        except sqlite3.DatabaseError as e:
+            if not _is_corruption_error(e):
+                logger.warning(f"[MemoryStorage] Integrity check skipped: {e}")
+                return None
+            report = str(e)
+        return None if report == "ok" else report
+
+    def _repair_search_indexes(self, conn: sqlite3.Connection):
+        """Rebuild whichever search index is flagged or found broken."""
+        if not self.fts5_available:
+            return
+        from common.log import logger
+        with self._lock:
+            flags = {
+                row[0] for row in conn.execute(
+                    "SELECT key FROM _meta WHERE key IN (?, ?)",
+                    (_FTS_REBUILD_PENDING, _TRIGRAM_DONE),
+                )
+            }
+            if _FTS_REBUILD_PENDING in flags or self._fts5_shadow_corrupt(conn):
+                logger.warning("[MemoryStorage] Rebuilding FTS5 index from chunks.")
+                self._recreate(conn, self._drop_fts5_objects, self._create_fts5_objects)
+                self._refill_index(conn, "chunks_fts")
+                with conn:
+                    conn.execute("DELETE FROM _meta WHERE key = ?", (_FTS_REBUILD_PENDING,))
+            if self.trigram_fts5_available and _TRIGRAM_DONE not in flags:
+                if conn.execute("SELECT 1 FROM chunks LIMIT 1").fetchone():
+                    logger.info("[MemoryStorage] Rebuilding trigram index from chunks.")
+                    self._recreate(
+                        conn, self._drop_trigram_objects, self._create_trigram_objects
+                    )
+                    self._refill_index(conn, "chunks_fts_trigram")
+                with conn:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO _meta(key, value) VALUES(?, '1')",
+                        (_TRIGRAM_DONE,),
+                    )
+
+    @staticmethod
+    def _recreate(conn: sqlite3.Connection, drop, create):
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            drop(conn)
+            create(conn)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    @staticmethod
+    def _refill_index(conn: sqlite3.Connection, table: str):
+        """Feed every existing chunk into an empty index, a batch at a time.
+
+        Rows written after this starts reach the index through its triggers,
+        so only rows up to the current maximum rowid are fed here."""
+        top = conn.execute("SELECT MAX(rowid) FROM chunks").fetchone()[0]
+        if top is None:
+            return
+        last = conn.execute("SELECT MIN(rowid) FROM chunks").fetchone()[0] - 1
+        while last < top:
+            row = conn.execute(
+                "SELECT rowid FROM chunks WHERE rowid > ? AND rowid <= ? "
+                "ORDER BY rowid LIMIT 1 OFFSET ?",
+                (last, top, _REFILL_BATCH - 1),
+            ).fetchone()
+            end = row[0] if row else top
+            with conn:
+                conn.execute(
+                    f"INSERT INTO {table}(rowid, text, id, user_id, path, source, scope) "
+                    "SELECT rowid, text, id, user_id, path, source, scope FROM chunks "
+                    "WHERE rowid > ? AND rowid <= ?",
+                    (last, end),
+                )
+            last = end
+
+    def _init_db(self):
+        """Initialize database with schema.
+
+        Runs on every session's first message, so it only issues statements
+        that don't depend on the size of the database; anything that reads the
+        index is left to _schedule_maintenance.
+        """
+        try:
+            try:
+                self.conn = self._open_conn()
+            except sqlite3.DatabaseError as e:
+                # The conversation history lives in this file too, so it stays
+                # where it is for manual repair rather than being moved away.
+                if _is_corruption_error(e):
+                    from common.log import logger
+                    logger.error(
+                        f"[MemoryStorage] Database unreadable, left in place "
+                        f"(repair manually, e.g. sqlite3 .recover): {self.db_path}: {e}"
+                    )
+                raise
+
+            # Check FTS5 support
+            self.fts5_available = self._check_fts5_support()
+            if not _HAS_UPSERT:
+                from common.log import logger
+                logger.warning(
+                    "[MemoryStorage] SQLite %s < 3.24 — UPSERT unavailable. "
+                    "Falling back to INSERT OR REPLACE; FTS5 rowid may drift on "
+                    "chunk updates (rebuild index periodically to recover).",
+                    sqlite3.sqlite_version,
+                )
+            if not self.fts5_available:
+                from common.log import logger
+                logger.debug("[MemoryStorage] FTS5 not available, using LIKE-based keyword search")
+        except Exception as e:
+            from common.log import logger
+            logger.error(f"[MemoryStorage] Unexpected error during database initialization: {e}")
+            raise
+
+        # Create chunks table with embeddings
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS chunks (
+                id TEXT PRIMARY KEY,
+                user_id TEXT,
+                scope TEXT NOT NULL DEFAULT 'shared',
+                source TEXT NOT NULL DEFAULT 'memory',
+                path TEXT NOT NULL,
+                start_line INTEGER NOT NULL,
+                end_line INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                embedding TEXT,
+                hash TEXT NOT NULL,
+                metadata TEXT,
+                created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+            )
+        """)
+
+        # Create indexes
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_chunks_user 
+            ON chunks(user_id)
+        """)
+
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_chunks_scope 
+            ON chunks(scope)
+        """)
+
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_chunks_hash 
+            ON chunks(path, hash)
+        """)
+
+        # Internal key-value store for persistent flags (e.g. backfill tracking)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS _meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+
+        repair_pending = False
+        # Create FTS5 virtual table + triggers (only if supported).
+        # If the previous process crashed mid-rebuild and left triggers
+        # pointing at a missing chunks_fts (or vice versa), the missing side is
+        # created here so chunk writes keep working, and the index is flagged
+        # to be refilled in the background.
+        if self.fts5_available:
+            if self._fts5_state_inconsistent(self.conn):
+                from common.log import logger
+                logger.warning(
+                    "[MemoryStorage] FTS5 state inconsistent (triggers/table mismatch). "
+                    "Rebuilding chunks_fts in the background."
+                )
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO _meta(key, value) VALUES(?, '1')",
+                    (_FTS_REBUILD_PENDING,),
+                )
+                repair_pending = True
+            self._create_fts5_objects(self.conn)
+
+        # Create trigram FTS5 table for CJK / mixed-language search
+        self.trigram_fts5_available = False
+        if self.fts5_available:
+            try:
+                if self._migrate_legacy_trigram_update_trigger():
+                    repair_pending = True
+                self._create_trigram_objects(self.conn)
+                self.trigram_fts5_available = True
+                # An empty chunks table has nothing to backfill; its trigram
+                # index is kept complete by the triggers from here on.
+                if not self.conn.execute(
+                    "SELECT 1 FROM chunks LIMIT 1"
+                ).fetchone():
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO _meta(key, value) VALUES(?, '1')",
+                        (_TRIGRAM_DONE,),
+                    )
+            except Exception:
+                from common.log import logger
+                logger.warning("[MemoryStorage] trigram FTS5 unavailable, CJK search will use LIKE fallback", exc_info=True)
+                self.trigram_fts5_available = False
+
+        # Create files metadata table
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS files (
+                path TEXT PRIMARY KEY,
+                source TEXT NOT NULL DEFAULT 'memory',
+                hash TEXT NOT NULL,
+                mtime INTEGER NOT NULL,
+                size INTEGER NOT NULL,
+                updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+            )
+        """)
+
+        self.conn.commit()
+        self._schedule_maintenance(repair_pending)
+
+    def _migrate_legacy_trigram_update_trigger(self) -> bool:
+        """Replace the legacy chunks_trigram_au trigger if present.
+
+        Older versions synced updates with a bare
+        "UPDATE chunks_fts_trigram SET ...", which corrupts the external-content
+        trigram index on chunk updates. We detect that shape via the stored
+        trigger SQL, drop it (dropping a trigger touches no data), and flag a
+        trigram rebuild so any already-damaged index is repaired in the
+        background. Returns True when the rebuild was flagged.
+        """
+        try:
+            row = self.conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' "
+                "AND name='chunks_trigram_au'"
+            ).fetchone()
+        except Exception:
+            return False
+        if not row or not row[0]:
+            return False
+        if "UPDATE chunks_fts_trigram" not in row[0]:
+            return False
+        from common.log import logger
+        logger.warning(
+            "[MemoryStorage] Replacing legacy chunks_trigram_au trigger; "
+            "rebuilding the trigram index in the background."
+        )
+        self.conn.execute("DROP TRIGGER IF EXISTS chunks_trigram_au")
+        self.conn.execute("DELETE FROM _meta WHERE key = ?", (_TRIGRAM_DONE,))
+        return True
+
+    @staticmethod
+    def _fts5_state_inconsistent(conn: sqlite3.Connection) -> bool:
+        """Detect a half-broken FTS5 setup (e.g. trigger exists but table doesn't)."""
+        try:
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='chunks_fts'"
+            ).fetchone()
+            table_exists = row is not None
+            row = conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' "
+                "AND name IN ('chunks_ai','chunks_ad','chunks_au')"
+            ).fetchone()
+            trigger_count = int(row[0]) if row else 0
+        except Exception:
+            return False
+        # Healthy = both present (3 triggers + table) or both absent.
+        return table_exists != (trigger_count > 0)
+
+    @staticmethod
+    def _drop_fts5_objects(conn: sqlite3.Connection):
+        # Triggers first; otherwise the next chunks write hits
+        # "no such table: chunks_fts".
+        conn.execute("DROP TRIGGER IF EXISTS chunks_ai")
+        conn.execute("DROP TRIGGER IF EXISTS chunks_ad")
+        conn.execute("DROP TRIGGER IF EXISTS chunks_au")
+        conn.execute("DROP TABLE IF EXISTS chunks_fts")
+
+    @staticmethod
+    def _create_fts5_objects(conn: sqlite3.Connection):
+        """Create chunks_fts virtual table and the 3 sync triggers (idempotent)."""
+        conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                text,
+                id UNINDEXED,
+                user_id UNINDEXED,
+                path UNINDEXED,
+                source UNINDEXED,
+                scope UNINDEXED,
+                content='chunks',
+                content_rowid='rowid'
+            )
+        """)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
+                INSERT INTO chunks_fts(rowid, text, id, user_id, path, source, scope)
+                VALUES (new.rowid, new.text, new.id, new.user_id, new.path, new.source, new.scope);
+            END
+        """)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
+                DELETE FROM chunks_fts WHERE rowid = old.rowid;
+            END
+        """)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
+                UPDATE chunks_fts SET text = new.text, id = new.id,
+                                     user_id = new.user_id, path = new.path,
+                                     source = new.source, scope = new.scope
+                WHERE rowid = new.rowid;
+            END
+        """)
+
+    @staticmethod
+    def _drop_trigram_objects(conn: sqlite3.Connection):
+        conn.execute("DROP TRIGGER IF EXISTS chunks_trigram_ai")
+        conn.execute("DROP TRIGGER IF EXISTS chunks_trigram_ad")
+        conn.execute("DROP TRIGGER IF EXISTS chunks_trigram_au")
+        conn.execute("DROP TABLE IF EXISTS chunks_fts_trigram")
+
+    @staticmethod
+    def _create_trigram_objects(conn: sqlite3.Connection):
+        """Create chunks_fts_trigram and its 3 sync triggers (idempotent)."""
+        conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts_trigram USING fts5(
+                text,
+                id UNINDEXED,
+                user_id UNINDEXED,
+                path UNINDEXED,
+                source UNINDEXED,
+                scope UNINDEXED,
+                content='chunks',
+                content_rowid='rowid',
+                tokenize='trigram case_sensitive 0'
+            )
+        """)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS chunks_trigram_ai
+            AFTER INSERT ON chunks BEGIN
+                INSERT INTO chunks_fts_trigram(rowid, text, id, user_id, path, source, scope)
+                VALUES (new.rowid, new.text, new.id, new.user_id, new.path, new.source, new.scope);
+            END
+        """)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS chunks_trigram_ad
+            AFTER DELETE ON chunks BEGIN
+                DELETE FROM chunks_fts_trigram WHERE rowid = old.rowid;
+            END
+        """)
+        # External-content FTS5 requires the delete+insert pattern on
+        # UPDATE: a bare "UPDATE chunks_fts_trigram SET ..." leaves the
+        # old tokens in the index and corrupts the trigram shadow tables
+        # ("database disk image is malformed"). The special 'delete'
+        # command removes the old row's tokens using its previous text.
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS chunks_trigram_au
+            AFTER UPDATE ON chunks BEGIN
+                INSERT INTO chunks_fts_trigram(chunks_fts_trigram, rowid, text, id, user_id, path, source, scope)
+                VALUES ('delete', old.rowid, old.text, old.id, old.user_id, old.path, old.source, old.scope);
+                INSERT INTO chunks_fts_trigram(rowid, text, id, user_id, path, source, scope)
+                VALUES (new.rowid, new.text, new.id, new.user_id, new.path, new.source, new.scope);
+            END
+        """)
+
+    def reset_fts5(self):
+        """Drop and recreate chunks_fts + triggers in one transaction.
+
+        Used by rebuild_index to recover from FTS5 shadow-table corruption
+        (bm25/ORDER BY rank may raise "database disk image is malformed"
+        even when raw MATCH still works).
+        """
+        if not self.fts5_available:
+            return
+        with self._lock:
+            self._recreate(self.conn, self._drop_fts5_objects, self._create_fts5_objects)
+
+    @staticmethod
+    def _fts5_shadow_corrupt(conn: sqlite3.Connection) -> bool:
+        """Probe whether bm25 over chunks_fts errors out.
+
+        Schema (table + triggers) can be intact while the underlying
+        FTS5 shadow blobs are malformed — typically because the previous
+        process crashed mid-write or wrote with a different SQLite build.
+        A cheap MATCH probe surfaces it immediately."""
+        try:
+            conn.execute(
+                "SELECT bm25(chunks_fts) FROM chunks_fts WHERE chunks_fts MATCH 'a' LIMIT 1"
+            ).fetchone()
+            return False
+        except sqlite3.DatabaseError as e:
+            msg = str(e).lower()
+            return "malformed" in msg or "corrupt" in msg
+        except Exception:
+            # Any other error (e.g. table missing) is handled by the
+            # state-inconsistent path; treat as healthy here.
+            return False
+
+    def save_chunk(self, chunk: MemoryChunk):
+        """Save a memory chunk (insert or update by id).
+
+        Uses SQLite UPSERT (INSERT … ON CONFLICT DO UPDATE) instead of
+        INSERT OR REPLACE.  INSERT OR REPLACE internally does DELETE+INSERT,
+        which changes the row's rowid.  Because both FTS5 tables use
+        content_rowid='rowid', a new rowid would leave the old FTS index
+        entries pointing at a non-existent rowid and trigger
+        "fts5: missing row N from content table" errors.
+        ON CONFLICT DO UPDATE fires the AFTER UPDATE trigger (chunks_au /
+        chunks_trigram_au) and keeps the original rowid intact.
+        """
+        if _HAS_UPSERT:
+            _SQL = """
+                INSERT INTO chunks
+                (id, user_id, scope, source, path, start_line, end_line,
+                 text, embedding, hash, metadata, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+                ON CONFLICT(id) DO UPDATE SET
+                    user_id     = excluded.user_id,
+                    scope       = excluded.scope,
+                    source      = excluded.source,
+                    path        = excluded.path,
+                    start_line  = excluded.start_line,
+                    end_line    = excluded.end_line,
+                    text        = excluded.text,
+                    embedding   = excluded.embedding,
+                    hash        = excluded.hash,
+                    metadata    = excluded.metadata,
+                    updated_at  = strftime('%s', 'now')
+            """
+        else:
+            _SQL = """
+                INSERT OR REPLACE INTO chunks
+                (id, user_id, scope, source, path, start_line, end_line,
+                 text, embedding, hash, metadata, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+            """
+        params = (
+            chunk.id, chunk.user_id, chunk.scope, chunk.source, chunk.path,
+            chunk.start_line, chunk.end_line, chunk.text,
+            None,
+            chunk.hash,
+            json.dumps(chunk.metadata) if chunk.metadata else None,
+        )
+        with self._lock:
+            try:
+                self.conn.execute(_SQL, params)
+                self.vector_backend.upsert([self._to_vector_record(chunk)])
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def save_chunks_batch(self, chunks: List[MemoryChunk]):
+        """Save multiple chunks in a batch (insert or update by id).
+
+        See save_chunk for why UPSERT is used instead of INSERT OR REPLACE.
+        """
+        if _HAS_UPSERT:
+            _SQL = """
+                INSERT INTO chunks
+                (id, user_id, scope, source, path, start_line, end_line,
+                 text, embedding, hash, metadata, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+                ON CONFLICT(id) DO UPDATE SET
+                    user_id     = excluded.user_id,
+                    scope       = excluded.scope,
+                    source      = excluded.source,
+                    path        = excluded.path,
+                    start_line  = excluded.start_line,
+                    end_line    = excluded.end_line,
+                    text        = excluded.text,
+                    embedding   = excluded.embedding,
+                    hash        = excluded.hash,
+                    metadata    = excluded.metadata,
+                    updated_at  = strftime('%s', 'now')
+            """
+        else:
+            _SQL = """
+                INSERT OR REPLACE INTO chunks
+                (id, user_id, scope, source, path, start_line, end_line,
+                 text, embedding, hash, metadata, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+            """
+        params_list = [
+            (
+                c.id, c.user_id, c.scope, c.source, c.path,
+                c.start_line, c.end_line, c.text,
+                None,
+                c.hash,
+                json.dumps(c.metadata) if c.metadata else None,
+            )
+            for c in chunks
+        ]
+        with self._lock:
+            try:
+                self.conn.executemany(_SQL, params_list)
+                self.vector_backend.upsert([
+                    self._to_vector_record(chunk) for chunk in chunks
+                ])
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+    
+    def get_chunk(self, chunk_id: str) -> Optional[MemoryChunk]:
+        """Get a chunk by ID"""
+        row = self.conn.execute("""
+            SELECT * FROM chunks WHERE id = ?
+        """, (chunk_id,)).fetchone()
+        
+        if not row:
+            return None
+        
+        return self._row_to_chunk(row)
+    
+    def search_vector(
+        self,
+        query_embedding: List[float],
+        user_id: Optional[str] = None,
+        scopes: List[str] = None,
+        limit: int = 10
+    ) -> List[SearchResult]:
+        """Search the configured vector backend."""
+        if scopes is None:
+            scopes = ["shared"]
+            if user_id:
+                scopes.append("user")
+        metadata_filter = {"scopes": scopes}
+        if user_id:
+            metadata_filter["user_id"] = user_id
+        matches = self.vector_backend.search(
+            query_embedding,
+            limit=limit,
+            metadata_filter=metadata_filter,
+        )
+        return [
+            SearchResult(
+                path=match.metadata["path"],
+                start_line=match.metadata["start_line"],
+                end_line=match.metadata["end_line"],
+                score=match.score,
+                snippet=self._truncate_text(match.metadata["text"], 500),
+                source=match.metadata["source"],
+                user_id=match.metadata.get("user_id"),
+            )
+            for match in matches
+        ]
+    
+    def search_keyword(
+        self,
+        query: str,
+        user_id: Optional[str] = None,
+        scopes: List[str] = None,
+        limit: int = 10
+    ) -> List[SearchResult]:
+        """
+        Keyword search using FTS5 + LIKE fallback
+
+        Strategy:
+        1. If FTS5 available and healthy: try FTS5 first
+        2. Always fall back to LIKE for CJK queries
+        3. If FTS5 fails OR returns empty for non-CJK, also try LIKE so a
+           broken FTS5 shadow table doesn't silently kill keyword search.
+        """
+        if scopes is None:
+            scopes = ["shared"]
+            if user_id:
+                scopes.append("user")
+
+        # Step 1: Standard FTS5 (unicode61) — pure ASCII queries only.
+        # Skipped when query contains any CJK characters: unicode61 tokenises CJK
+        # as individual characters without forming meaningful tokens, so it would
+        # match only the ASCII portion of a mixed query (e.g. "Python" from
+        # "Python教程") and silently discard the CJK part.  Those queries go
+        # directly to Step 2 (trigram), which handles both ASCII and CJK together.
+        fts1_attempted = False
+        if (self.fts5_available
+                and not MemoryStorage._contains_cjk(query)
+                and MemoryStorage._build_fts_query(query)):
+            fts1_attempted = True
+            fts_results = self._search_fts5(query, user_id, scopes, limit)
+            if fts_results:
+                return fts_results
+
+        # Step 2: Trigram FTS5 — CJK/mixed queries, plus fallback when unicode61
+        # returned nothing (trigram indexes all scripts with 3-char sliding windows,
+        # so it can catch terms that unicode61 tokenisation misses).
+        if self.trigram_fts5_available and (
+            MemoryStorage._contains_cjk(query) or fts1_attempted
+        ):
+            trigram_results = self._search_fts5_trigram(query, user_id, scopes, limit)
+            if trigram_results:
+                return trigram_results
+
+        # Step 3: LIKE fallback — last resort (FTS5 unavailable, CJK queries
+        # trigram cannot match, or an FTS5 stage that found nothing).
+        if (not self.fts5_available
+                or MemoryStorage._contains_cjk(query)
+                or fts1_attempted):
+            return self._search_like(query, user_id, scopes, limit)
+
+        return []
+    
+    def _search_fts5(
+        self,
+        query: str,
+        user_id: Optional[str],
+        scopes: List[str],
+        limit: int
+    ) -> List[SearchResult]:
+        """FTS5 full-text search"""
+        fts_query = self._build_fts_query(query)
+        if not fts_query:
+            return []
+        
+        scope_placeholders = ','.join('?' * len(scopes))
+        params = [fts_query] + scopes
+        
+        if user_id:
+            sql_query = f"""
+                SELECT chunks.*, bm25(chunks_fts) as rank
+                FROM chunks_fts
+                JOIN chunks ON chunks.rowid = chunks_fts.rowid
+                WHERE chunks_fts MATCH ? 
+                AND chunks.scope IN ({scope_placeholders})
+                AND (chunks.scope = 'shared' OR chunks.user_id = ?)
+                ORDER BY rank
+                LIMIT ?
+            """
+            params.extend([user_id, limit])
+        else:
+            sql_query = f"""
+                SELECT chunks.*, bm25(chunks_fts) as rank
+                FROM chunks_fts
+                JOIN chunks ON chunks.rowid = chunks_fts.rowid
+                WHERE chunks_fts MATCH ? 
+                AND chunks.scope IN ({scope_placeholders})
+                ORDER BY rank
+                LIMIT ?
+            """
+            params.append(limit)
+        
+        try:
+            rows = self.conn.execute(sql_query, params).fetchall()
+            return [
+                SearchResult(
+                    path=row['path'],
+                    start_line=row['start_line'],
+                    end_line=row['end_line'],
+                    score=self._bm25_rank_to_score(row['rank']),
+                    snippet=self._truncate_text(row['text'], 500),
+                    source=row['source'],
+                    user_id=row['user_id']
+                )
+                for row in rows
+            ]
+        except Exception:
+            from common.log import logger
+            logger.warning("[MemoryStorage] _search_fts5 failed, returning empty", exc_info=True)
+            return []
+
+    def _search_like(
+        self,
+        query: str,
+        user_id: Optional[str],
+        scopes: List[str],
+        limit: int
+    ) -> List[SearchResult]:
+        """LIKE-based search.
+
+        Used as the keyword-search fallback when FTS5 is unavailable, fails,
+        or returns empty. Supports both CJK runs (1+ chars) and Unicode word
+        tokens (3+ chars) so it can serve as a true safety net for any query.
+        """
+        # Keep CJK runs separate from adjacent words, as in the trigram query.
+        cjk_words = _RE_CJK_WORDS.findall(query)
+        word_text = _RE_CONTAINS_CJK.sub(' ', query)
+        words = cjk_words + [t for t in re.findall(r'\w+', word_text) if len(t) >= 3]
+        if not words:
+            return []
+
+        scope_placeholders = ','.join('?' * len(scopes))
+
+        # Build LIKE conditions for each word (case-insensitive for ASCII)
+        like_conditions = []
+        params = []
+        for word in words:
+            like_conditions.append("LOWER(text) LIKE ?")
+            params.append(f'%{word.lower()}%')
+        
+        where_clause = ' OR '.join(like_conditions)
+        params.extend(scopes)
+        
+        if user_id:
+            sql_query = f"""
+                SELECT * FROM chunks
+                WHERE ({where_clause})
+                AND scope IN ({scope_placeholders})
+                AND (scope = 'shared' OR user_id = ?)
+                LIMIT ?
+            """
+            params.extend([user_id, limit])
+        else:
+            sql_query = f"""
+                SELECT * FROM chunks
+                WHERE ({where_clause})
+                AND scope IN ({scope_placeholders})
+                LIMIT ?
+            """
+            params.append(limit)
+        
+        try:
+            rows = self.conn.execute(sql_query, params).fetchall()
+            results = []
+            for row in rows:
+                # Dynamic score: reward chunks that contain more of the query words.
+                # Use all tokens (CJK + ASCII) so pure-ASCII queries are not skipped.
+                # matched_count is always ≥1 because the WHERE clause uses OR, but
+                # guard defensively so unexpected zero-match rows are never surfaced.
+                text_lower = row['text'].lower()
+                matched_count = sum(1 for w in words if w.lower() in text_lower)
+                if matched_count == 0:
+                    continue
+                score = min(0.85, 0.3 + 0.15 * matched_count)
+                results.append(SearchResult(
+                    path=row['path'],
+                    start_line=row['start_line'],
+                    end_line=row['end_line'],
+                    score=score,
+                    snippet=self._truncate_text(row['text'], 500),
+                    source=row['source'],
+                    user_id=row['user_id']
+                ))
+            results.sort(key=lambda r: r.score, reverse=True)
+            return results
+        except Exception:
+            from common.log import logger
+            logger.warning("[MemoryStorage] _search_like failed, returning empty", exc_info=True)
+            return []
+
+    def delete_by_path(self, path: str):
+        """Delete all chunks and file metadata for a path."""
+        with self._lock:
+            try:
+                self.vector_backend.delete(metadata_filter={"path": path})
+                self.conn.execute("DELETE FROM chunks WHERE path = ?", (path,))
+                self.conn.execute("DELETE FROM files WHERE path = ?", (path,))
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    # --- _meta: internal key-value flags (e.g. chunker_version) -----------
+    def get_meta(self, key: str) -> Optional[str]:
+        """Read a persistent flag from the _meta table, or None if unset."""
+        try:
+            row = self.conn.execute(
+                "SELECT value FROM _meta WHERE key = ?", (key,)
+            ).fetchone()
+        except Exception:
+            return None
+        return row["value"] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        """Write a persistent flag to the _meta table."""
+        with self._lock:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO _meta(key, value) VALUES(?, ?)",
+                (key, str(value)),
+            )
+            self.conn.commit()
+
+    def get_file_hash(self, path: str) -> Optional[str]:
+        """Get stored file hash"""
+        row = self.conn.execute("""
+            SELECT hash FROM files WHERE path = ?
+        """, (path,)).fetchone()
+        return row['hash'] if row else None
+
+    def list_paths(self, source: str) -> List[str]:
+        """Every path currently indexed under a source."""
+        rows = self.conn.execute(
+            "SELECT path FROM files WHERE source = ?", (source,)
+        ).fetchall()
+        return [row['path'] for row in rows]
+
+    def update_file_metadata(self, path: str, source: str, file_hash: str, mtime: int, size: int):
+        """Update file metadata"""
+        with self._lock:
+            self.conn.execute("""
+                INSERT OR REPLACE INTO files (path, source, hash, mtime, size, updated_at)
+                VALUES (?, ?, ?, ?, ?, strftime('%s', 'now'))
+            """, (path, source, file_hash, mtime, size))
+            self.conn.commit()
+    
+    def get_stats(self) -> Dict[str, int]:
+        """Get storage statistics"""
+        chunks_count = self.conn.execute("""
+            SELECT COUNT(*) as cnt FROM chunks
+        """).fetchone()['cnt']
+
+        files_count = self.conn.execute("""
+            SELECT COUNT(*) as cnt FROM files
+        """).fetchone()['cnt']
+
+        embedded_count = self.conn.execute("""
+            SELECT COUNT(*) as cnt FROM chunks WHERE embedding IS NOT NULL
+        """).fetchone()['cnt']
+
+        return {
+            'chunks': chunks_count,
+            'files': files_count,
+            'embedded': embedded_count,
+        }
+    
+    def close(self):
+        """Close database connection"""
+        if self.conn:
+            try:
+                self.conn.commit()  # Ensure all changes are committed
+                self.conn.close()
+                self.conn = None  # Mark as closed
+            except Exception as e:
+                from common.log import logger
+                logger.warning("[MemoryStorage] Error closing database connection: %s", e)
+    
+    def __del__(self):
+        """Destructor to ensure connection is closed"""
+        try:
+            self.close()
+        except Exception:
+            pass  # Ignore errors during cleanup
+    
+    # Helper methods
+
+    @staticmethod
+    def _to_vector_record(chunk: MemoryChunk) -> VectorRecord:
+        return VectorRecord(
+            id=chunk.id,
+            embedding=chunk.embedding,
+            metadata={
+                "user_id": chunk.user_id,
+                "scope": chunk.scope,
+                "source": chunk.source,
+                "path": chunk.path,
+                "start_line": chunk.start_line,
+                "end_line": chunk.end_line,
+                "text": chunk.text,
+                "metadata": chunk.metadata,
+            },
+        )
+
+    @staticmethod
+    def _decode_embedding(raw) -> Optional[List[float]]:
+        """Decode embedding from BLOB bytes or legacy JSON string.
+        Handles both numpy and numpy-free environments."""
+        if raw is None:
+            return None
+        if isinstance(raw, (bytes, bytearray)):
+            if _HAS_NUMPY:
+                return np.frombuffer(raw, dtype=np.float32).tolist()
+            import struct
+            n = len(raw) // 4
+            return list(struct.unpack(f'{n}f', raw))
+        # Legacy JSON format written by older versions
+        return json.loads(raw)
+
+    def _row_to_chunk(self, row) -> MemoryChunk:
+        """Convert database row to MemoryChunk"""
+        return MemoryChunk(
+            id=row['id'],
+            user_id=row['user_id'],
+            scope=row['scope'],
+            source=row['source'],
+            path=row['path'],
+            start_line=row['start_line'],
+            end_line=row['end_line'],
+            text=row['text'],
+            embedding=self._decode_embedding(row['embedding']),
+            hash=row['hash'],
+            metadata=json.loads(row['metadata']) if row['metadata'] else None
+        )
+    
+    @staticmethod
+    def _contains_cjk(text: str) -> bool:
+        """Check if text contains CJK or related characters (Chinese, Japanese, Korean)."""
+        return bool(_RE_CONTAINS_CJK.search(text))
+    
+    @staticmethod
+    def _build_trigram_query(raw_query: str) -> Optional[str]:
+        """
+        Build FTS5 MATCH query for the trigram tokenizer.
+        Extracts CJK sequences (including single characters) and Unicode words,
+        joining them with AND so all terms must appear in the matched chunk.
+        """
+        tokens = _RE_TRIGRAM_TOKENS.findall(raw_query)
+        tokens = [t for t in tokens if t]
+        if not tokens:
+            return None
+        # Escape embedded double-quotes (FTS5 uses "" inside quoted phrases)
+        quoted = [f'"{t.replace(chr(34), chr(34)*2)}"' for t in tokens]
+        return ' AND '.join(quoted)
+
+    def _search_fts5_trigram(
+        self,
+        query: str,
+        user_id: Optional[str],
+        scopes: List[str],
+        limit: int
+    ) -> List[SearchResult]:
+        """Trigram FTS5 search — handles CJK and mixed queries with BM25 ranking."""
+        trigram_query = self._build_trigram_query(query)
+        if not trigram_query:
+            return []
+
+        scope_placeholders = ','.join('?' * len(scopes))
+        params = [trigram_query] + list(scopes)
+
+        if user_id:
+            sql = f"""
+                SELECT chunks.*, bm25(chunks_fts_trigram) as rank
+                FROM chunks_fts_trigram
+                JOIN chunks ON chunks.rowid = chunks_fts_trigram.rowid
+                WHERE chunks_fts_trigram MATCH ?
+                AND chunks.scope IN ({scope_placeholders})
+                AND (chunks.scope = 'shared' OR chunks.user_id = ?)
+                ORDER BY rank
+                LIMIT ?
+            """
+            params.extend([user_id, limit])
+        else:
+            sql = f"""
+                SELECT chunks.*, bm25(chunks_fts_trigram) as rank
+                FROM chunks_fts_trigram
+                JOIN chunks ON chunks.rowid = chunks_fts_trigram.rowid
+                WHERE chunks_fts_trigram MATCH ?
+                AND chunks.scope IN ({scope_placeholders})
+                ORDER BY rank
+                LIMIT ?
+            """
+            params.append(limit)
+
+        try:
+            rows = self.conn.execute(sql, params).fetchall()
+            return [
+                SearchResult(
+                    path=row['path'],
+                    start_line=row['start_line'],
+                    end_line=row['end_line'],
+                    score=self._bm25_rank_to_score(row['rank']),
+                    snippet=self._truncate_text(row['text'], 500),
+                    source=row['source'],
+                    user_id=row['user_id']
+                )
+                for row in rows
+            ]
+        except Exception:
+            from common.log import logger
+            logger.warning("[MemoryStorage] _search_fts5_trigram failed, returning empty", exc_info=True)
+            return []
+
+    @staticmethod
+    def _build_fts_query(raw_query: str) -> Optional[str]:
+        """
+        Build FTS5 query from raw text
+        
+        Works best for English and word-based languages.
+        For CJK characters, LIKE search will be used as fallback.
+        """
+        # SQLite's unicode61 tokenizer supports words outside the ASCII alphabet.
+        tokens = re.findall(r'\w+', raw_query)
+        if not tokens:
+            return None
+        
+        # Quote tokens for exact matching
+        quoted = [f'"{t}"' for t in tokens]
+        # Use OR for more flexible matching
+        return ' OR '.join(quoted)
+    
+    @staticmethod
+    def _bm25_rank_to_score(rank: float) -> float:
+        """Convert SQLite BM25 rank to a [0, 1) relevance score.
+
+        SQLite's bm25() returns a non-positive float (0 or negative).
+        More negative = more relevant.  max(0, rank) would clip every
+        negative value to 0, making every score 1/(1+0) = 1.0 and
+        destroying all ranking information.
+
+        abs(rank) / (1 + abs(rank)) maps the absolute relevance magnitude
+        to [0, 1): larger |rank| (stronger match) → score closer to 1.
+        """
+        if rank is None:
+            return 0.0
+        # Add a floor of 0.3 so any FTS5 match always exceeds typical
+        # min_score thresholds (default 0.1).  Small-corpus ranks close to
+        # 0 would otherwise produce score≈0 and be filtered out downstream.
+        return 0.3 + 0.69 * (abs(rank) / (1.0 + abs(rank)))
+    
+    @staticmethod
+    def _truncate_text(text: str, max_chars: int) -> str:
+        """Truncate text to max characters"""
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars] + "..."
+    
+    @staticmethod
+    def compute_hash(content: str) -> str:
+        """Compute SHA256 hash of content"""
+        return hashlib.sha256(content.encode('utf-8')).hexdigest()

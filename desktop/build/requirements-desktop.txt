@@ -1,0 +1,75 @@
+# Desktop backend dependencies (slimmed down from the full requirements).
+#
+# Goal: keep the package light. The desktop client only needs the web channel
+# (which Electron talks to) plus the agent core; the remaining IM channels are
+# cheap (~27MB total) so we keep them.
+#
+# Feishu's `lark-oapi` (~122MB unpacked) is NOT listed here on purpose: the
+# desktop client downloads a trimmed ~1MB bundle the first time the user enables
+# the Feishu channel (channel/feishu/lark_install.py), keeping the base download
+# small. That bundle relies on `requests` and `pycryptodome` below rather than
+# shipping its own copies.
+
+# cryptography (pulled in by dashscope) stopped shipping macOS x86_64 wheels at
+# 49.0. A source build links the runner's Homebrew OpenSSL, and PyInstaller then
+# bundles it beside Python's older libssl.3.dylib under the same name, so the
+# extension fails to load on users' machines. Wheels link OpenSSL statically;
+# forcing them makes pip settle on the newest version that has one per arch.
+--only-binary=cryptography
+
+# ---- core ----
+numpy>=1.21
+# aiohttp<3.10 has no prebuilt wheels for Python 3.13+ (would need MSVC to build).
+aiohttp>=3.8.6,<3.10; python_version < "3.13"
+aiohttp>=3.10; python_version >= "3.13"
+requests>=2.28.2
+chardet>=5.1.0
+Pillow
+python-dotenv>=1.0.0
+PyYAML>=6.0
+croniter>=2.0.0
+# zoneinfo is stdlib from 3.9 (the Win7 build runs 3.8); Windows has no system tz database
+backports.zoneinfo; python_version < "3.9"
+tzdata; sys_platform == "win32"
+click>=8.0
+qrcode
+json-repair
+
+# ---- web framework (web channel) ----
+# web.py 0.62 (the last release supporting Python < 3.10) imports the stdlib cgi
+# module removed in 3.13; 0.76 dropped it but requires 3.10+.
+web.py; python_version < "3.10"
+web.py>=0.76; python_version >= "3.10"
+
+# ---- AI model SDKs ----
+zai-sdk
+dashscope
+tenacity        # used by some dashscope submodules (retry logic)
+google-generativeai
+tiktoken>=0.3.2
+
+# ---- voice (TTS/ASR) — kept per product decision ----
+pydub>=0.25.1
+gTTS>=2.3.1
+
+# ---- document parsing (web_fetch / knowledge) ----
+pypdf
+python-docx
+openpyxl
+python-pptx
+
+# ---- browser tool ----
+# Only the pure-Python package + Node driver are bundled by PyInstaller (~10-15MB).
+# The Chromium binary is NOT bundled: the browser tool drives the user's system
+# Chrome/Edge, or downloads Chromium on demand into ~/.cow at first use.
+playwright==1.52.0
+
+# ---- IM channels (kept; lightweight). Feishu/lark-oapi is fetched on demand
+#      by the desktop client when the user enables the channel (see header note). ----
+wechatpy
+pycryptodome
+dingtalk_stream
+websocket-client>=1.4.0
+python-telegram-bot
+slack_bolt
+discord.py
